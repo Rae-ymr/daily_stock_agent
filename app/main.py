@@ -8,30 +8,104 @@ Then visit http://127.0.0.1:8000/docs for the interactive API explorer.
 
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from agent.graph import run_pipeline
+from agent.graph import (
+    agent_reasoning_node,
+    draft_summary_node,
+    ingest_node,
+    log_and_notify_node,
+    retrieve_and_grade_node,
+)
+from agent.retrieval import build_vector_store
 from app.heatmap import build_heatmap_html
+from app.session_store import create_session, delete_session, load_session, update_session
 from data.ingest_prices import fetch_price_history
+
+# Mirrors the revision cap in agent/graph.py's route_after_checkpoint —
+# reject twice and the pipeline finalizes as rejected instead of
+# drafting a third time.
+MAX_REVISIONS = 2
 
 app = FastAPI(title="Daily Stock Analysis Agent")
 
 
-class ChatRequest(BaseModel):
+class AnalyzeRequest(BaseModel):
     ticker: str
 
 
-@app.post("/chat")
-def chat(req: ChatRequest):
-    """Runs the full pipeline for a given ticker and returns the result."""
-    # NOTE: run_pipeline currently has a blocking input() call in
-    # human_checkpoint_node — you'll want to replace that with a
-    # proper two-step API flow (submit draft -> separate approve
-    # endpoint) before this works well over HTTP.
-    result = run_pipeline(req.ticker)
-    return result
+class ApproveRequest(BaseModel):
+    approved: bool
+
+
+@app.post("/analyze")
+def analyze(req: AnalyzeRequest):
+    """
+    Runs the pipeline through draft_summary_node and stops there — the API
+    equivalent of the first half of human_checkpoint_node ("show the
+    draft"). The draft is stashed in Redis under a session_id; call
+    POST /approve/{session_id} with the human's decision to continue.
+    """
+    state = {"ticker": req.ticker}
+    state.update(ingest_node(state))
+    state["store"] = build_vector_store(state["news"])
+    state.update(retrieve_and_grade_node(state))
+    state.update(agent_reasoning_node(state))
+    state.update(draft_summary_node(state))
+
+    session_id = create_session(
+        {
+            "ticker": state["ticker"],
+            "price_summary": state.get("price_summary", ""),
+            "analysis": state.get("analysis", ""),
+            "draft": state["draft"],
+            "revision_count": 0,
+        }
+    )
+    return {"session_id": session_id, "ticker": req.ticker, "draft": state["draft"]}
+
+
+@app.post("/approve/{session_id}")
+def approve(session_id: str, req: ApproveRequest):
+    """
+    The API equivalent of the second half of human_checkpoint_node
+    ("approve or reject"). Approval (or hitting MAX_REVISIONS) finalizes
+    via log_and_notify_node; rejection under the cap redrafts and waits
+    for another call to this same endpoint.
+    """
+    state = load_session(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    if req.approved:
+        log_and_notify_node({"ticker": state["ticker"], "approved": True, "draft": state["draft"]})
+        delete_session(session_id)
+        return {"session_id": session_id, "status": "final", "approved": True, "draft": state["draft"]}
+
+    revision_count = state["revision_count"] + 1
+    if revision_count >= MAX_REVISIONS:
+        log_and_notify_node({"ticker": state["ticker"], "approved": False, "draft": state["draft"]})
+        delete_session(session_id)
+        return {"session_id": session_id, "status": "final", "approved": False, "draft": state["draft"]}
+
+    redraft = draft_summary_node(
+        {
+            "ticker": state["ticker"],
+            "price_summary": state["price_summary"],
+            "analysis": state["analysis"],
+        }
+    )
+    state["draft"] = redraft["draft"]
+    state["revision_count"] = revision_count
+    update_session(session_id, state)
+    return {
+        "session_id": session_id,
+        "status": "pending",
+        "revision_count": revision_count,
+        "draft": state["draft"],
+    }
 
 
 @app.get("/heatmap", response_class=HTMLResponse)

@@ -25,7 +25,7 @@ daily-stock-agent/
 │   ├── test_set.json          # Your labeled question/answer examples
 │   └── run_eval.py             # Scores the agent against test_set.json
 ├── app/
-│   └── main.py                  # FastAPI wrapper (/chat, /eval, /health)
+│   └── main.py                  # FastAPI wrapper (/analyze, /approve, /eval, /health)
 ├── requirements.txt
 ├── .env.example                # Copy to .env and fill in your keys
 ├── Dockerfile
@@ -105,14 +105,21 @@ real expected answers in `test_set.json` once you've seen real drafts to
 know what a good answer looks like.
 
 ### 8. `app/main.py` — wraps everything behind an API
+Needs Redis reachable (used to hold draft state between `/analyze` and
+`/approve` — see `docs/human_checkpoint_flow.md`). Run one locally first:
 ```bash
+redis-server &
 uvicorn app.main:app --reload
 ```
-Then open `http://127.0.0.1:8000/docs` to see and test the `/chat`, `/eval`,
-and `/health` endpoints interactively. Note: the human-checkpoint step
-currently blocks on terminal input, which won't work well over HTTP — you'll
-want to split it into a "submit draft" + "approve draft" endpoint pair once
-you get here (that's a good Week 4 productionizing task).
+Then open `http://127.0.0.1:8000/docs` to see and test the endpoints
+interactively:
+- `POST /analyze {ticker}` — runs the pipeline through `draft_summary_node`,
+  returns `{session_id, draft}`.
+- `POST /approve/{session_id} {approved}` — approve to finalize, or reject
+  to get a redraft (up to the same revision cap as the CLI flow); call it
+  again with the new `session_id`-scoped draft until it's approved or the
+  cap is hit.
+- `/heatmap`, `/eval`, `/health` — unchanged.
 
 ### 9. Docker — run everything in one command, once the app works locally
 ```bash

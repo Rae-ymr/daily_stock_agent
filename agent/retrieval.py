@@ -3,8 +3,9 @@ Corrective RAG: retrieve, grade relevance, retry with a rewritten query
 if the retrieval was weak. This is the piece to build and test FIRST,
 in isolation, before wiring it into the full agent graph.
 
-Requires OPENAI_API_KEY in .env (used for embeddings + the grade/rewrite
-LLM calls).
+Requires GROQ_API_KEY (or OPENAI_API_KEY, see agent/llm.py) in .env for the
+grade/rewrite LLM calls. Embeddings run locally via sentence-transformers —
+no API key needed.
 
 Run standalone:
     python -m agent.retrieval "What happened to AAPL this week?"
@@ -13,13 +14,15 @@ Run standalone:
 import sys
 
 from data.ingest_news import fetch_news
+from agent.llm import get_chat_llm
 
 from langchain_core.documents import Document
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
 MAX_RETRIES = 2
-_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+_llm = get_chat_llm()
+_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
 def build_vector_store(documents: list[dict]):
@@ -40,7 +43,7 @@ def build_vector_store(documents: list[dict]):
         )
         for doc in documents
     ]
-    return Chroma.from_documents(docs, embedding=OpenAIEmbeddings())
+    return Chroma.from_documents(docs, embedding=_embeddings)
 
 
 def retrieve(query: str, store, k: int = 5) -> list[dict]:

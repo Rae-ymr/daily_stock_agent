@@ -19,13 +19,13 @@ from email.mime.text import MIMEText
 from typing import Optional, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
+from agent.llm import get_chat_llm
 from agent.retrieval import retrieve_with_retry
 from agent.tools import get_price_summary, get_recent_news
 
-_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+_llm = get_chat_llm()
 _tools = [get_price_summary, get_recent_news]
 _tools_by_name = {t.name: t for t in _tools}
 _llm_with_tools = _llm.bind_tools(_tools)

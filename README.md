@@ -94,12 +94,15 @@ in your terminal — that's intentional, it's your approval gate.
 
 ### 7. `eval/run_eval.py` — run once `agent/graph.py` produces real answers
 ```bash
-python eval/run_eval.py
+python -m eval.run_eval
 ```
-Loads `eval/test_set.json`, runs each question through the agent (you'll
-need to wire the `TODO` line to actually call `run_pipeline`), and prints a
-score. Fill in `test_set.json` with real expected answers once you have real
-data flowing.
+Loads `eval/test_set.json`, runs each case's `ticker` through the pipeline
+up to `draft_summary_node` (skipping the human-approval step, which isn't
+meaningful in an automated eval), and scores the draft against
+`expected_answer` via embedding cosine similarity. Cases still holding the
+placeholder `expected_answer` text are skipped, not scored as 0 — fill in
+real expected answers in `test_set.json` once you've seen real drafts to
+know what a good answer looks like.
 
 ### 8. `app/main.py` — wraps everything behind an API
 ```bash

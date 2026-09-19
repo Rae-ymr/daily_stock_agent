@@ -1,13 +1,85 @@
-(.venv) rachel@dhcp-10-24-94-167 daily_stock_agent % python -m eval.run_eval
-/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
-  warnings.warn(
-/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/langgraph/cache/base/__init__.py:8: LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change in a future version. Pass an explicit value (e.g., allowed_objects='messages' or allowed_objects='core') to suppress this warning.
-  from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+INFO:     127.0.0.1:49632 - "GET /openapi.json HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49631 - "POST /analyze HTTP/1.1" 500 Internal Server Error
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/connection.py", line 855, in connect_check_health
+    sock = self.retry.call_with_retry(
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/retry.py", line 116, in call_with_retry
+    return do()
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/connection.py", line 856, in <lambda>
+    lambda: self._connect(), lambda error: self.disconnect(error)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/connection.py", line 1306, in _connect
+    raise err
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/connection.py", line 1290, in _connect
+    sock.connect(socket_address)
+ConnectionRefusedError: [Errno 61] Connection refused
 
-Average similarity score: 0.00 (0/2 cases scored)
+During handling of the above exception, another exception occurred:
 
-[not scored (placeholder expected_answer)] What was AAPL's closing price trend over the last 5 days?
-    -> AAPL stock experienced a modest increase of +0.92% over the past five days, rising from $333.08 to $336.13, driven by positive sentiment and analyst confidence in new product offerings. However, conce
+Traceback (most recent call last):
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/uvicorn/protocols/http/httptools_impl.py", line 415, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__
+    return await self.app(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/fastapi/applications.py", line 1138, in __call__
+    await super().__call__(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/applications.py", line 113, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/routing.py", line 716, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/routing.py", line 736, in app
+    await route.handle(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/routing.py", line 290, in handle
+    await self.app(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/fastapi/routing.py", line 121, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/fastapi/routing.py", line 107, in app
+    response = await f(request)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/fastapi/routing.py", line 426, in app
+    raw_response = await run_endpoint_function(
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/fastapi/routing.py", line 316, in run_endpoint_function
+    return await run_in_threadpool(dependant.call, **values)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/starlette/concurrency.py", line 38, in run_in_threadpool
+    return await anyio.to_thread.run_sync(func)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/anyio/to_thread.py", line 63, in run_sync
+    return await get_async_backend().run_sync_in_worker_thread(
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/anyio/_backends/_asyncio.py", line 2502, in run_sync_in_worker_thread
+    return await future
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/anyio/_backends/_asyncio.py", line 986, in run
+    result = context.run(func, *args)
+  File "/Users/rachel/Documents/llm/daily_stock_agent/app/main.py", line 58, in analyze
+    session_id = create_session(
+  File "/Users/rachel/Documents/llm/daily_stock_agent/app/session_store.py", line 42, in create_session
+    _client.setex(_key(session_id), SESSION_TTL_SECONDS, json.dumps(state))
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/commands/core.py", line 2335, in setex
+    return self.execute_command("SETEX", name, time, value)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/client.py", line 657, in execute_command
+    return self._execute_command(*args, **options)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/client.py", line 663, in _execute_command
+    conn = self.connection or pool.get_connection()
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/utils.py", line 196, in wrapper
+    return func(*args, **kwargs)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/connection.py", line 2601, in get_connection
+    connection.connect()
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/connection.py", line 846, in connect
+    self.connect_check_health(check_health=True)
+  File "/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/redis/connection.py", line 863, in connect_check_health
+    raise ConnectionError(self._error_message(e))
+redis.exceptions.ConnectionError: Error 61 connecting to localhost:6379. Connection refused.
 
-[not scored (placeholder expected_answer)] Was there any notable news about MSFT this week?
-    -> Microsoft (MSFT) experienced a decline in its stock price, dropping 2.30% over the last five days to $493.78. This movement comes amid significant news regarding the company's transition to two busine

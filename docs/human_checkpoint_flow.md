@@ -1,5 +1,9 @@
 # Human checkpoint: CLI vs. API flow
 
+For the technical/intel/risk/decision agent design upstream of the draft
+shown here, see `docs/multi_agent_architecture.md` — this doc only covers
+the human-approval step.
+
 Design note for the `/chat` fix discussed for `app/main.py`. `run_pipeline()`
 (via `agent/graph.py`'s `human_checkpoint_node`) blocks on a terminal
 `input()` call for approval — fine for `python -m agent.graph AAPL`, but an

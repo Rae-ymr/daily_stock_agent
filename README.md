@@ -6,9 +6,10 @@ human approval before anything is logged or sent out.
 
 Every module below is implemented, not a stub — the one exception is
 `agent/tools.py`'s `check_forecast_anomaly`, an optional forecasting/anomaly
-hook left for later. See `docs/human_checkpoint_flow.md` for the design of
-the human-approval step (CLI `input()` vs. the API's `/analyze` + `/approve`
-split).
+hook left for later. See `docs/multi_agent_architecture.md` for how the
+technical/intel/risk/decision agents fit together, and
+`docs/human_checkpoint_flow.md` for the design of the human-approval step
+(CLI `input()` vs. the API's `/analyze` + `/approve` split).
 
 ## Project structure
 
@@ -32,7 +33,8 @@ daily-stock-agent/
 │   ├── session_store.py        # Redis-backed session state between /analyze and /approve
 │   └── heatmap.py               # Renders the /heatmap HTML
 ├── docs/
-│   └── human_checkpoint_flow.md # CLI vs. API flow for the human-approval step
+│   ├── multi_agent_architecture.md # technical/intel/risk/decision agent design
+│   └── human_checkpoint_flow.md   # CLI vs. API flow for the human-approval step
 ├── requirements.txt
 ├── .env.example                # Copy to .env and fill in your keys
 ├── Dockerfile

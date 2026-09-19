@@ -1,0 +1,13 @@
+(.venv) rachel@dhcp-10-24-94-167 daily_stock_agent % python -m eval.run_eval
+/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+/Users/rachel/Documents/llm/.venv/lib/python3.9/site-packages/langgraph/cache/base/__init__.py:8: LangChainPendingDeprecationWarning: The default value of `allowed_objects` will change in a future version. Pass an explicit value (e.g., allowed_objects='messages' or allowed_objects='core') to suppress this warning.
+  from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+Average similarity score: 0.00 (0/2 cases scored)
+
+[not scored (placeholder expected_answer)] What was AAPL's closing price trend over the last 5 days?
+    -> AAPL stock experienced a modest increase of +0.92% over the past five days, rising from $333.08 to $336.13, driven by positive sentiment and analyst confidence in new product offerings. However, conce
+
+[not scored (placeholder expected_answer)] Was there any notable news about MSFT this week?
+    -> Microsoft (MSFT) experienced a decline in its stock price, dropping 2.30% over the last five days to $493.78. This movement comes amid significant news regarding the company's transition to two busine

@@ -1,8 +1,10 @@
 # Daily Stock Analysis Agent
 
-A corrective-RAG agent that ingests price + news data for a ticker, retrieves and
-self-corrects on relevant context, drafts a summary/recommendation, and stops for
-human approval before anything is logged or sent out.
+A multi-agent pipeline that ingests price + news data for a ticker, runs a
+corrective-RAG retrieval step, splits analysis across parallel technical and
+intel agents, screens the result through a dedicated risk agent, combines
+everything into a structured buy/hold/sell decision, and stops for human
+approval before anything is logged or sent out.
 
 Every module below is implemented, not a stub — the one exception is
 `agent/tools.py`'s `check_forecast_anomaly`, an optional forecasting/anomaly
@@ -16,15 +18,16 @@ technical/intel/risk/decision agents fit together, and
 ```
 daily-stock-agent/
 ├── data/
-│   ├── ingest_prices.py      # Pulls price history via yfinance
+│   ├── ingest_prices.py      # Pulls price history + fundamentals (P/E, P/B) via yfinance
 │   └── ingest_news.py        # Pulls news headlines via Tavily
 ├── agent/
 │   ├── llm.py                    # Picks the chat LLM (Groq default, OpenAI optional)
 │   ├── retrieval.py           # Corrective RAG: retrieve, grade, retry
-│   ├── tools.py                 # Agent tools (price summary, news lookup)
+│   ├── tools.py                 # Price summary + news lookup tools, used by ingest_node
 │   ├── memory.py               # Conversation history
 │   └── graph.py                 # LangGraph pipeline: ingest → retrieve/grade →
-│                                   reasoning → draft → human checkpoint → notify
+│                                   [technical, intel] (parallel) → risk → decision
+│                                   → draft → human checkpoint → notify
 ├── eval/
 │   ├── test_set.json          # Labeled ticker/question/expected_answer cases
 │   └── run_eval.py             # Runs the pipeline per case, scores by embedding similarity
@@ -50,6 +53,7 @@ python -m venv venv && source venv/bin/activate   # or venv\Scripts\activate on 
 pip install -r requirements.txt
 cp .env.example .env
 # now edit .env with your real API keys (GROQ_API_KEY or OPENAI_API_KEY, TAVILY_API_KEY)
+# RISK_OVERRIDE_ENABLED defaults to true — leave it unless you're debugging risk_node
 ```
 
 ## How to run each piece
@@ -82,7 +86,10 @@ relevance with an LLM → if weak, rewrite the query and retry (up to
 python -m agent.tools AAPL
 ```
 Prints a price summary and recent news for AAPL, wrapped as LangChain
-`@tool`s so `agent/graph.py`'s reasoning step can call them directly.
+`@tool`s. `ingest_node` in `agent/graph.py` invokes them directly (not via
+an LLM tool-calling loop — there isn't one in this pipeline; the `@tool`
+wrapping is kept for interface consistency and in case a future node
+needs the LLM to call them dynamically).
 
 ### 5. `agent/memory.py` — standalone, no dependencies
 ```bash
@@ -95,12 +102,16 @@ Sanity check that the memory object stores and returns messages correctly.
 python -m agent.graph AAPL
 ```
 Runs the full pipeline: ingest → retrieve & grade → `technical` + `intel`
-(run in parallel, one reasoning over price data only, the other over
-retrieved news only) → `decision` (combines both into a structured
-buy/hold/sell + price target via `DecisionOutput`) → draft summary → human
-checkpoint → log & notify. `human_checkpoint_node` pauses for a y/n input
-in your terminal — that's the approval gate. Reject twice and it finalizes
-as rejected instead of drafting a third time (see `route_after_checkpoint`).
+(run in parallel — one reasoning over price data only, the other over
+retrieved news only) → `risk` (fans in from both; screens for insider
+activity, earnings/regulatory risk, and P/E-P/B valuation anomalies) →
+`decision` (combines all three into a structured buy/hold/sell + price
+target via `DecisionOutput`, with `risk`'s hard/soft flags enforced by
+`apply_risk_override()` — see `docs/multi_agent_architecture.md`) → draft
+summary → human checkpoint → log & notify. `human_checkpoint_node` pauses
+for a y/n input in your terminal — that's the approval gate. Reject twice
+and it finalizes as rejected instead of drafting a third time (see
+`route_after_checkpoint`).
 
 ### 7. `eval/run_eval.py`
 ```bash
@@ -121,7 +132,8 @@ uvicorn app.main:app --reload
 ```
 Then open `http://127.0.0.1:8000/docs` to test the endpoints interactively:
 - `POST /analyze {ticker}` — runs the pipeline through `draft_summary_node`,
-  returns `{session_id, draft}`.
+  returns `{session_id, decision, draft}` (`decision` is the structured
+  `DecisionOutput` JSON — buy/hold/sell, price target, rationale).
 - `POST /approve/{session_id} {approved}` — approve to finalize, or reject
   to get a redraft (same revision cap as the CLI flow); call it again with
   the same `session_id` until it's approved or the cap is hit.

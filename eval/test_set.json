@@ -2,11 +2,11 @@
   {
     "ticker": "AAPL",
     "question": "What was AAPL's closing price trend over the last 5 days?",
-    "expected_answer": "REPLACE WITH A REAL EXPECTED ANSWER ONCE YOU HAVE REAL DATA"
+    "expected_answer": "AAPL's closing price moved modestly over the last 5 days (a small single-digit percentage change, up or down), and the answer should state the direction and rough size of the move, ideally with a reason drawn from recent news such as product announcements or analyst sentiment."
   },
   {
     "ticker": "MSFT",
     "question": "Was there any notable news about MSFT this week?",
-    "expected_answer": "REPLACE WITH A REAL EXPECTED ANSWER ONCE YOU HAVE REAL DATA"
+    "expected_answer": "The answer should mention a specific, concrete piece of recent MSFT news (e.g. a business/organizational change, product launch, earnings update, or partnership) rather than only price movement, since the question asks about news, not price."
   }
 ]

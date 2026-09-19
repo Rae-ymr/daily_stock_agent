@@ -1,0 +1,10 @@
+[
+  {
+    "question": "What was AAPL's closing price trend over the last 5 days?",
+    "expected_answer": "REPLACE WITH A REAL EXPECTED ANSWER ONCE YOU HAVE REAL DATA"
+  },
+  {
+    "question": "Was there any notable news about MSFT this week?",
+    "expected_answer": "REPLACE WITH A REAL EXPECTED ANSWER ONCE YOU HAVE REAL DATA"
+  }
+]

@@ -1,0 +1,14 @@
+langgraph
+langchain
+langchain-openai
+langchain-anthropic
+chromadb
+langchain-chroma
+yfinance
+requests
+tavily-python
+fastapi
+uvicorn[standard]
+ragas
+python-dotenv
+pydantic

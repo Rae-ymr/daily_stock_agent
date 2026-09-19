@@ -1,14 +1,14 @@
 """
 Wires the pipeline stages together as a LangGraph StateGraph:
-  ingest -> retrieve_and_grade -> agent_reasoning -> draft_summary
-  -> human_checkpoint -> approved: log_and_notify
-                          rejected: back to draft_summary (up to 2 revisions)
+  ingest -> retrieve_and_grade -> [technical, intel] (parallel) -> decision
+  -> draft_summary -> human_checkpoint -> approved: log_and_notify
+                                           rejected: back to draft_summary
+                                           (up to 2 revisions)
 
-Fill in:
-  - agent_reasoning_node (needs an LLM client)
-  - draft_summary_node (needs an LLM client)
+technical_node and intel_node run in the same superstep, fanning out from
+retrieve_and_grade and fanning back in at decision_node — see build_graph().
 
-Run standalone (once agent_reasoning_node/draft_summary_node are filled in):
+Run standalone:
     python -m agent.graph AAPL
 """
 
@@ -16,20 +16,55 @@ import os
 import smtplib
 import sys
 from email.mime.text import MIMEText
-from typing import Optional, TypedDict
+from typing import Literal, Optional, TypedDict
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 
 from agent.llm import get_chat_llm
 from agent.retrieval import retrieve_with_retry
 from agent.tools import get_price_summary, get_recent_news
+from data.ingest_prices import fetch_fundamentals
 
 _llm = get_chat_llm()
-_tools = [get_price_summary, get_recent_news]
-_tools_by_name = {t.name: t for t in _tools}
-_llm_with_tools = _llm.bind_tools(_tools)
-MAX_TOOL_ROUNDS = 3
+
+# Hard risk flags veto a buy outright only when this is true — a kill
+# switch in case the override logic itself misbehaves and needs to be
+# disabled without a code change.
+RISK_OVERRIDE_ENABLED = os.getenv("RISK_OVERRIDE_ENABLED", "true").lower() == "true"
+
+
+class DecisionOutput(BaseModel):
+    """Structured final call from decision_node — kept out of free text so
+    the buy/hold/sell signal and price target are always machine-readable,
+    not something scraped out of prose."""
+
+    decision: Literal["buy", "hold", "sell"]
+    price_target: Optional[float] = Field(
+        default=None, description="Suggested price level, only if the analysis supports one"
+    )
+    rationale: str
+
+
+class RiskFlag(BaseModel):
+    """A single risk finding from risk_node."""
+
+    severity: Literal["soft", "hard"]
+    category: Literal[
+        "insider_activity",
+        "earnings_warning",
+        "regulatory_action",
+        "valuation_anomaly",
+        "lockup_expiration",
+        "other",
+    ]
+    detail: str
+
+
+class RiskAssessment(BaseModel):
+    flags: list[RiskFlag] = Field(default_factory=list)
+    summary: str
 
 
 class AgentState(TypedDict):
@@ -38,6 +73,10 @@ class AgentState(TypedDict):
     price_summary: str
     news: list[dict]
     retrieved_context: list[dict]
+    technical_analysis: str
+    intel_analysis: str
+    risk_assessment: Optional[dict]
+    decision: Optional[dict]
     analysis: str
     draft: str
     approved: bool
@@ -62,44 +101,197 @@ def retrieve_and_grade_node(state: AgentState) -> dict:
     return {"retrieved_context": retrieve_with_retry(query, store)}
 
 
-def agent_reasoning_node(state: AgentState) -> dict:
+def technical_node(state: AgentState) -> dict:
     """
-    Stage 3: lets the LLM reason over price_summary + retrieved_context.
-    It can call get_price_summary/get_recent_news again (e.g. for a
-    different ticker mentioned in the news) if it decides the context
-    it already has isn't enough, up to MAX_TOOL_ROUNDS.
+    Stage 3a: reasons over price_summary only — no news, no market context.
+    Runs in parallel with intel_node; both feed decision_node. Deliberately
+    scoped to price data alone so its read isn't contaminated by sentiment.
+
+    v1: works off price_summary as-is (5-day % change). Real moving
+    averages / volume / support-resistance levels are the planned next
+    pass, once this parallel wiring is confirmed working end-to-end.
     """
-    context = "\n".join(
-        f"- {c['content']}" for c in state.get("retrieved_context", [])
-    )
     messages = [
         SystemMessage(
-            "You are a financial analysis assistant preparing notes for a "
-            "daily stock summary. Use the price and news context given. "
-            "Call a tool only if that context is missing something you need."
+            "You are a technical analyst. Judge only the price action "
+            "given — trend and momentum, and a rough support or resistance "
+            "level if the data implies one. Do not reference news or "
+            "sentiment; that's a separate analyst's job."
         ),
         HumanMessage(
             f"Ticker: {state['ticker']}\n"
-            f"Price summary: {state.get('price_summary', 'unavailable')}\n"
-            f"Recent news context:\n{context or 'none retrieved'}\n\n"
-            "Analyze what's driving this stock and note anything uncertain."
+            f"Price summary: {state.get('price_summary', 'unavailable')}\n\n"
+            "Give a short technical read."
         ),
     ]
+    response = _llm.invoke(messages)
+    return {"technical_analysis": response.content}
 
-    for _ in range(MAX_TOOL_ROUNDS):
-        response = _llm_with_tools.invoke(messages)
-        messages.append(response)
-        if not response.tool_calls:
-            return {"analysis": response.content}
-        for call in response.tool_calls:
-            result = _tools_by_name[call["name"]].invoke(call["args"])
-            messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
-    return {"analysis": messages[-1].content}
+def intel_node(state: AgentState) -> dict:
+    """
+    Stage 3b: reasons over retrieved_context (corrective-RAG news) only —
+    no price data. Runs in parallel with technical_node; both feed
+    decision_node.
+
+    v1: single-ticker news only, via retrieve_and_grade_node's output.
+    Market-wide risk (SPY/QQQ price + news) is the planned next pass.
+    """
+    context = "\n".join(f"- {c['content']}" for c in state.get("retrieved_context", []))
+    messages = [
+        SystemMessage(
+            "You are a news/sentiment analyst. Judge only the retrieved "
+            "headlines given — what's driving sentiment, and any risk they "
+            "imply. Do not reference price data; that's a separate "
+            "analyst's job."
+        ),
+        HumanMessage(
+            f"Ticker: {state['ticker']}\n"
+            f"Recent news context:\n{context or 'none retrieved'}\n\n"
+            "Give a short read on sentiment and risk."
+        ),
+    ]
+    response = _llm.invoke(messages)
+    return {"intel_analysis": response.content}
+
+
+def risk_node(state: AgentState) -> dict:
+    """
+    RiskAgent — dedicated risk screening specialist.
+
+    Responsible for:
+    - Scanning for insider sell-downs, earnings warnings, regulatory actions
+    - Checking valuation anomalies (PE/PB extremes)
+    - Evaluating lock-up expiration risks
+    - Producing risk flags that can override or downgrade signals from other agents
+
+    Risk flags use a two-level severity system:
+    - soft: downgrades the signal and adds a visible warning
+    - hard: vetoes buy signals entirely when risk override is enabled
+
+    Implementation notes: runs after technical_node and intel_node (both
+    feed into this fan-in) since it needs their reads to know what it
+    might be overriding. Insider/earnings/regulatory/lock-up signals come
+    from a targeted corrective-RAG query against the same news store
+    retrieve_and_grade_node already built — no new data source. Valuation
+    anomalies come from a real fundamentals fetch. The soft/hard override
+    itself is applied deterministically in decision_node's
+    apply_risk_override(), not left to the LLM to self-enforce.
+    """
+    store = state.get("store")
+    risk_context = []
+    if store is not None:
+        risk_query = (
+            f"{state['ticker']} insider selling, earnings warning, "
+            "regulatory investigation, or lock-up expiration"
+        )
+        risk_context = retrieve_with_retry(risk_query, store)
+    news_text = "\n".join(f"- {c['content']}" for c in risk_context) or "none found"
+
+    fundamentals = fetch_fundamentals(state["ticker"])
+
+    messages = [
+        SystemMessage(
+            "You are a risk screening specialist. Flag concrete risks only "
+            "— insider sell-downs, earnings warnings, regulatory actions, "
+            "lock-up expirations, or valuation extremes (PE/PB far outside "
+            "a normal range). Don't invent risks the data doesn't support. "
+            "severity='hard' only for something that should block a buy "
+            "outright; 'soft' for something worth a visible warning but "
+            "not a veto. Empty flags list if nothing concrete is found."
+        ),
+        HumanMessage(
+            f"Ticker: {state['ticker']}\n"
+            f"Technical read: {state.get('technical_analysis', 'none')}\n"
+            f"Intel read: {state.get('intel_analysis', 'none')}\n"
+            f"Risk-focused news search:\n{news_text}\n"
+            f"Fundamentals: trailing P/E={fundamentals.get('trailing_pe')}, "
+            f"forward P/E={fundamentals.get('forward_pe')}, "
+            f"price/book={fundamentals.get('price_to_book')}\n\n"
+            "List any risk flags found."
+        ),
+    ]
+    result: RiskAssessment = _llm.with_structured_output(RiskAssessment).invoke(messages)
+    return {"risk_assessment": result.model_dump()}
+
+
+def apply_risk_override(result: DecisionOutput, flags: list[dict]) -> DecisionOutput:
+    """
+    Enforces RiskAgent's two-level severity contract on decision_node's
+    output. Applied after the LLM call, not inside the prompt, so the
+    override is guaranteed rather than something the model might forget:
+    - hard flag + RISK_OVERRIDE_ENABLED: a "buy" is forced down to "hold".
+    - soft flag: a "buy" is downgraded to "hold" with a visible warning.
+    Non-buy decisions pass through unchanged either way — there's nothing
+    to veto or downgrade in a hold/sell.
+    """
+    if result.decision != "buy" or not flags:
+        return result
+
+    hard_flags = [f for f in flags if f["severity"] == "hard"]
+    soft_flags = [f for f in flags if f["severity"] == "soft"]
+
+    if hard_flags and RISK_OVERRIDE_ENABLED:
+        warning = "; ".join(f["detail"] for f in hard_flags)
+        return result.model_copy(
+            update={
+                "decision": "hold",
+                "rationale": f"{result.rationale}\n[RISK OVERRIDE — hard flag vetoed buy: {warning}]",
+            }
+        )
+    if soft_flags:
+        warning = "; ".join(f["detail"] for f in soft_flags)
+        return result.model_copy(
+            update={
+                "decision": "hold",
+                "rationale": f"{result.rationale}\n[RISK WARNING — downgraded: {warning}]",
+            }
+        )
+    return result
+
+
+def decision_node(state: AgentState) -> dict:
+    """
+    Stage 4: combines technical_node + intel_node + risk_node into one
+    structured decision (buy/hold/sell + optional price target) via
+    structured output, plus a human-readable `analysis` string so
+    draft_summary_node keeps working unchanged. If technical and intel
+    disagree, the rationale is told to say so explicitly rather than
+    silently picking a side; risk flags are enforced afterward by
+    apply_risk_override(), not left to the LLM's discretion.
+    """
+    technical = state.get("technical_analysis", "none")
+    intel = state.get("intel_analysis", "none")
+    risk = state.get("risk_assessment") or {"flags": [], "summary": "none"}
+    messages = [
+        SystemMessage(
+            "You combine a technical read and a news/sentiment read into "
+            "one final call. If they disagree, say so explicitly in the "
+            "rationale instead of silently picking a side. Factor in the "
+            "risk assessment given, but you don't need to enforce its "
+            "severity rules yourself — that's handled separately."
+        ),
+        HumanMessage(
+            f"Ticker: {state['ticker']}\n"
+            f"Technical analysis: {technical}\n"
+            f"News/intel analysis: {intel}\n"
+            f"Risk assessment: {risk['summary']}\n\n"
+            "Give a final buy/hold/sell decision with a rationale."
+        ),
+    ]
+    result: DecisionOutput = _llm.with_structured_output(DecisionOutput).invoke(messages)
+    result = apply_risk_override(result, risk["flags"])
+    analysis_text = (
+        f"Decision: {result.decision.upper()}"
+        + (f" (target: {result.price_target})" if result.price_target is not None else "")
+        + f"\nRationale: {result.rationale}"
+        + f"\n\nTechnical: {technical}\nIntel: {intel}\nRisk: {risk['summary']}"
+    )
+    return {"decision": result.model_dump(), "analysis": analysis_text}
 
 
 def draft_summary_node(state: AgentState) -> dict:
-    """Stage 4: produces the actual draft text, using the analysis notes."""
+    """Stage 5: produces the actual draft text, using the analysis notes."""
     prompt = (
         f"Ticker: {state['ticker']}\n"
         f"Price summary: {state.get('price_summary', 'unavailable')}\n"
@@ -114,7 +306,7 @@ def draft_summary_node(state: AgentState) -> dict:
 
 def human_checkpoint_node(state: AgentState) -> dict:
     """
-    Stage 5: for now, a CLI prompt is fine. Show the draft, ask for
+    Stage 6: for now, a CLI prompt is fine. Show the draft, ask for
     approve/edit/reject before it's considered final.
     """
     print("\n--- DRAFT ---")
@@ -165,7 +357,7 @@ def send_notification_email(ticker: str, draft: str) -> None:
 
 
 def log_and_notify_node(state: AgentState) -> dict:
-    """Stage 6: logs the outcome and emails the draft if it was approved."""
+    """Stage 7: logs the outcome and emails the draft if it was approved."""
     print(f"Logged. Approved: {state.get('approved')}")
     if state.get("approved"):
         send_notification_email(state["ticker"], state.get("draft", ""))
@@ -177,15 +369,26 @@ def build_graph():
     graph = StateGraph(AgentState)
     graph.add_node("ingest", ingest_node)
     graph.add_node("retrieve_and_grade", retrieve_and_grade_node)
-    graph.add_node("agent_reasoning", agent_reasoning_node)
+    graph.add_node("technical", technical_node)
+    graph.add_node("intel", intel_node)
+    graph.add_node("risk", risk_node)
+    graph.add_node("decision", decision_node)
     graph.add_node("draft_summary", draft_summary_node)
     graph.add_node("human_checkpoint", human_checkpoint_node)
     graph.add_node("log_and_notify", log_and_notify_node)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "retrieve_and_grade")
-    graph.add_edge("retrieve_and_grade", "agent_reasoning")
-    graph.add_edge("agent_reasoning", "draft_summary")
+    # Fan-out: technical and intel both run off retrieve_and_grade's output,
+    # in the same superstep (LangGraph runs them concurrently). Fan-in:
+    # risk only runs once both have completed, since it needs their reads
+    # to know what it might be overriding. decision runs after risk.
+    graph.add_edge("retrieve_and_grade", "technical")
+    graph.add_edge("retrieve_and_grade", "intel")
+    graph.add_edge("technical", "risk")
+    graph.add_edge("intel", "risk")
+    graph.add_edge("risk", "decision")
+    graph.add_edge("decision", "draft_summary")
     graph.add_edge("draft_summary", "human_checkpoint")
     graph.add_conditional_edges(
         "human_checkpoint",

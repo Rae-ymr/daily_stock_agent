@@ -13,11 +13,14 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from agent.graph import (
-    agent_reasoning_node,
+    decision_node,
     draft_summary_node,
     ingest_node,
+    intel_node,
     log_and_notify_node,
     retrieve_and_grade_node,
+    risk_node,
+    technical_node,
 )
 from agent.retrieval import build_vector_store
 from app.heatmap import build_heatmap_html
@@ -52,7 +55,10 @@ def analyze(req: AnalyzeRequest):
     state.update(ingest_node(state))
     state["store"] = build_vector_store(state["news"])
     state.update(retrieve_and_grade_node(state))
-    state.update(agent_reasoning_node(state))
+    state.update(technical_node(state))
+    state.update(intel_node(state))
+    state.update(risk_node(state))
+    state.update(decision_node(state))
     state.update(draft_summary_node(state))
 
     session_id = create_session(
@@ -64,7 +70,12 @@ def analyze(req: AnalyzeRequest):
             "revision_count": 0,
         }
     )
-    return {"session_id": session_id, "ticker": req.ticker, "draft": state["draft"]}
+    return {
+        "session_id": session_id,
+        "ticker": req.ticker,
+        "decision": state.get("decision"),
+        "draft": state["draft"],
+    }
 
 
 @app.post("/approve/{session_id}")

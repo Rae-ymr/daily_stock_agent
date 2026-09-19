@@ -11,8 +11,12 @@ HTTP request has no terminal to block on. This splits the single
 ```mermaid
 flowchart TD
     A[ingest] --> B[retrieve_and_grade]
-    B --> C[agent_reasoning]
-    C --> D[draft_summary]
+    B --> T[technical]
+    B --> I[intel]
+    T --> R[risk]
+    I --> R
+    R --> DEC[decision]
+    DEC --> D[draft_summary]
     D --> E["human_checkpoint\n(blocks on input())"]
     E -->|approved| F[log_and_notify]
     E -->|rejected, revision_count < 2| D
@@ -20,7 +24,7 @@ flowchart TD
     F --> G[END]
 ```
 
-## Proposed: API flow (`app/main.py`, not yet built)
+## API flow (`app/main.py`, as built)
 
 Same nodes, same conditional-revision logic — `human_checkpoint_node`'s
 `input()` is replaced by a stored draft that a second request approves or
@@ -30,8 +34,11 @@ rejects.
 flowchart TD
     subgraph R1["Request 1 — POST /analyze {ticker}"]
         A[ingest] --> B[retrieve_and_grade]
-        B --> C[agent_reasoning]
-        C --> D[draft_summary]
+        B --> T[technical]
+        B --> I[intel]
+        T --> DEC[decision]
+        I --> DEC
+        DEC --> D[draft_summary]
         D --> STORE[("save state\nkeyed by session_id")]
         STORE --> RESP1["response: {session_id, draft}"]
     end

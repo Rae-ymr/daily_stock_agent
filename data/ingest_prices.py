@@ -38,6 +38,21 @@ def fetch_price_history(ticker: str, period: str = "3mo") -> dict:
     }
 
 
+def fetch_fundamentals(ticker: str) -> dict:
+    """
+    Returns basic valuation metrics for a ticker via yfinance's `.info`.
+    Used by agent/graph.py's risk_node to screen for PE/PB extremes.
+    Fields are None if yfinance doesn't have them for this ticker —
+    common for newly-listed or thinly-covered names.
+    """
+    info = yf.Ticker(ticker).info
+    return {
+        "trailing_pe": info.get("trailingPE"),
+        "forward_pe": info.get("forwardPE"),
+        "price_to_book": info.get("priceToBook"),
+    }
+
+
 if __name__ == "__main__":
     ticker = sys.argv[1] if len(sys.argv) > 1 else "AAPL"
     result = fetch_price_history(ticker)

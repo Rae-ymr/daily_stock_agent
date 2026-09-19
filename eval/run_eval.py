@@ -21,10 +21,13 @@ import numpy as np
 from langchain_huggingface import HuggingFaceEmbeddings
 
 from agent.graph import (
-    agent_reasoning_node,
+    decision_node,
     draft_summary_node,
     ingest_node,
+    intel_node,
     retrieve_and_grade_node,
+    risk_node,
+    technical_node,
 )
 from agent.retrieval import build_vector_store
 
@@ -49,7 +52,10 @@ def run_agent(ticker: str) -> dict:
     state.update(ingest_node(state))
     state["store"] = build_vector_store(state["news"])
     state.update(retrieve_and_grade_node(state))
-    state.update(agent_reasoning_node(state))
+    state.update(technical_node(state))
+    state.update(intel_node(state))
+    state.update(risk_node(state))
+    state.update(decision_node(state))
     state.update(draft_summary_node(state))
     return state
 

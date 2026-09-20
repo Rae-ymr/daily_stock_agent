@@ -1,13 +1,13 @@
 """
 Wires the pipeline stages together as a LangGraph StateGraph:
-  ingest -> retrieve_and_grade -> [technical, intel, quant] (parallel)
-  -> risk -> decision -> draft_summary -> human_checkpoint
+  ingest -> retrieve_and_grade -> [technical, intel, quant, risk] (parallel)
+  -> decision -> draft_summary -> human_checkpoint
   -> approved: log_and_notify
      rejected: back to draft_summary (up to 2 revisions)
 
-technical_node, intel_node, and quant_node run in the same superstep,
-fanning out from retrieve_and_grade and fanning back in at risk_node —
-see build_graph().
+technical_node, intel_node, quant_node, and risk_node run in the same
+superstep, fanning out from retrieve_and_grade and fanning back in at
+decision_node — see build_graph().
 
 Run standalone:
     python -m agent.graph AAPL
@@ -37,14 +37,27 @@ _llm = get_chat_llm()
 RISK_OVERRIDE_ENABLED = os.getenv("RISK_OVERRIDE_ENABLED", "true").lower() == "true"
 
 
+class PriceRange(BaseModel):
+    low: float
+    high: float
+
+
+# Ordered bearish -> bullish so apply_risk_override can shift a decision
+# by index rather than special-casing every level.
+DECISION_LEVELS = ["strong_sell", "sell", "hold", "buy", "strong_buy"]
+
+
 class DecisionOutput(BaseModel):
     """Structured final call from decision_node — kept out of free text so
-    the buy/hold/sell signal and price target are always machine-readable,
-    not something scraped out of prose."""
+    the rating and price ranges are always machine-readable, not something
+    scraped out of prose."""
 
-    decision: Literal["buy", "hold", "sell"]
-    price_target: Optional[float] = Field(
-        default=None, description="Suggested price level, only if the analysis supports one"
+    decision: Literal["strong_buy", "buy", "hold", "sell", "strong_sell"]
+    buy_range: Optional[PriceRange] = Field(
+        default=None, description="Price range worth considering as an entry, if the analysis supports one"
+    )
+    sell_range: Optional[PriceRange] = Field(
+        default=None, description="Price range worth considering as an exit/take-profit, if the analysis supports one"
     )
     rationale: str
 
@@ -109,9 +122,9 @@ def retrieve_and_grade_node(state: AgentState) -> dict:
 def technical_node(state: AgentState) -> dict:
     """
     Stage 3a: reasons over price_summary + technical_indicators only — no
-    news, no market context. Runs in parallel with intel_node; both feed
-    decision_node (via risk_node). Deliberately scoped to price data alone
-    so its read isn't contaminated by sentiment.
+    news, no market context. Runs in parallel with intel_node, quant_node,
+    and risk_node; all four feed decision_node. Deliberately scoped to
+    price data alone so its read isn't contaminated by sentiment.
 
     Indicators (from data/ingest_prices.py's fetch_technical_indicators):
     5/20-day MA crossover, RSI(14), MACD(12/26/9), Bollinger Band width,
@@ -157,8 +170,8 @@ def technical_node(state: AgentState) -> dict:
 def intel_node(state: AgentState) -> dict:
     """
     Stage 3b: reasons over retrieved_context (corrective-RAG news) only —
-    no price data. Runs in parallel with technical_node; both feed
-    decision_node.
+    no price data. Runs in parallel with technical_node, quant_node, and
+    risk_node; all four feed decision_node.
 
     v1: single-ticker news only, via retrieve_and_grade_node's output.
     Market-wide risk (SPY/QQQ price + news) is the planned next pass.
@@ -186,8 +199,9 @@ def quant_node(state: AgentState) -> dict:
     Stage 3c: runs the trained LightGBM classifier — technical indicators
     plus an AutoARIMA forecast as features (see ml/features.py) — to get
     a probability that the 5-day forward return is positive. Runs in
-    parallel with technical_node/intel_node; it's an independent
-    quantitative signal that doesn't depend on either of their outputs.
+    parallel with technical_node, intel_node, and risk_node; it's an
+    independent quantitative signal that doesn't depend on any of their
+    outputs.
 
     This is a genuinely different kind of signal from technical_node:
     technical_node is an LLM *reasoning in words* over indicator values;
@@ -214,14 +228,19 @@ def risk_node(state: AgentState) -> dict:
     - soft: downgrades the signal and adds a visible warning
     - hard: vetoes buy signals entirely when risk override is enabled
 
-    Implementation notes: runs after technical_node and intel_node (both
-    feed into this fan-in) since it needs their reads to know what it
-    might be overriding. Insider/earnings/regulatory/lock-up signals come
-    from a targeted corrective-RAG query against the same news store
+    Implementation notes: runs in parallel with technical_node, intel_node,
+    and quant_node — all four fan out from retrieve_and_grade_node and fan
+    into decision_node. Risk detection here is self-contained (its own
+    targeted RAG query + a fundamentals fetch), so it doesn't need the
+    other three agents' reads to do its job — it flags what it flags
+    regardless of what technical/intel/quant concluded. The "override
+    other agents' signals" part happens downstream, in decision_node's
+    apply_risk_override(), which acts on the *final* combined decision
+    rather than on risk_node needing to see the others' intermediate
+    reads first. Insider/earnings/regulatory/lock-up signals come from a
+    targeted corrective-RAG query against the same news store
     retrieve_and_grade_node already built — no new data source. Valuation
-    anomalies come from a real fundamentals fetch. The soft/hard override
-    itself is applied deterministically in decision_node's
-    apply_risk_override(), not left to the LLM to self-enforce.
+    anomalies come from a real fundamentals fetch.
     """
     store = state.get("store")
     risk_context = []
@@ -234,12 +253,6 @@ def risk_node(state: AgentState) -> dict:
     news_text = "\n".join(f"- {c['content']}" for c in risk_context) or "none found"
 
     fundamentals = fetch_fundamentals(state["ticker"])
-    quant = state.get("quant_signal")
-    quant_text = (
-        f"{quant['probability_up']:.0%} probability of a positive 5-day return"
-        if quant
-        else "unavailable (model not trained — python -m ml.train)"
-    )
 
     messages = [
         SystemMessage(
@@ -253,9 +266,6 @@ def risk_node(state: AgentState) -> dict:
         ),
         HumanMessage(
             f"Ticker: {state['ticker']}\n"
-            f"Technical read: {state.get('technical_analysis', 'none')}\n"
-            f"Intel read: {state.get('intel_analysis', 'none')}\n"
-            f"Quant model signal: {quant_text}\n"
             f"Risk-focused news search:\n{news_text}\n"
             f"Fundamentals: trailing P/E={fundamentals.get('trailing_pe')}, "
             f"forward P/E={fundamentals.get('forward_pe')}, "
@@ -267,35 +277,59 @@ def risk_node(state: AgentState) -> dict:
     return {"risk_assessment": result.model_dump()}
 
 
+def compute_risk_level(flags: list[dict]) -> Literal["low", "medium", "high"]:
+    """
+    Deterministic risk badge from risk_node's flags — "high" if any hard
+    flag is present, "medium" if only soft flags, "low" otherwise. This is
+    a plain lookup, not an LLM judgment call, since RiskFlag.severity
+    already encodes exactly this.
+    """
+    severities = {f["severity"] for f in flags}
+    if "hard" in severities:
+        return "high"
+    if "soft" in severities:
+        return "medium"
+    return "low"
+
+
 def apply_risk_override(result: DecisionOutput, flags: list[dict]) -> DecisionOutput:
     """
     Enforces RiskAgent's two-level severity contract on decision_node's
     output. Applied after the LLM call, not inside the prompt, so the
     override is guaranteed rather than something the model might forget:
-    - hard flag + RISK_OVERRIDE_ENABLED: a "buy" is forced down to "hold".
-    - soft flag: a "buy" is downgraded to "hold" with a visible warning.
-    Non-buy decisions pass through unchanged either way — there's nothing
-    to veto or downgrade in a hold/sell.
+    - hard flag + RISK_OVERRIDE_ENABLED: forces the decision down to at
+      most "sell" — a hard risk finding (e.g. an active regulatory
+      investigation) should read as "high risk, sell," not a neutral
+      "hold." Already-bearish decisions ("sell"/"strong_sell") pass
+      through unchanged; there's nothing further to veto.
+    - soft flag (no hard, or override disabled): downgrades one level on
+      DECISION_LEVELS (e.g. "strong_buy" -> "buy", "buy" -> "hold").
     """
-    if result.decision != "buy" or not flags:
+    if not flags:
         return result
 
     hard_flags = [f for f in flags if f["severity"] == "hard"]
     soft_flags = [f for f in flags if f["severity"] == "soft"]
+    current_idx = DECISION_LEVELS.index(result.decision)
+    sell_idx = DECISION_LEVELS.index("sell")
 
     if hard_flags and RISK_OVERRIDE_ENABLED:
+        if current_idx <= sell_idx:
+            return result  # already sell/strong_sell — nothing to override
         warning = "; ".join(f["detail"] for f in hard_flags)
         return result.model_copy(
             update={
-                "decision": "hold",
-                "rationale": f"{result.rationale}\n[RISK OVERRIDE — hard flag vetoed buy: {warning}]",
+                "decision": "sell",
+                "rationale": f"{result.rationale}\n[RISK OVERRIDE — hard flag forced a sell: {warning}]",
             }
         )
     if soft_flags:
+        if current_idx == 0:
+            return result  # already the most bearish level
         warning = "; ".join(f["detail"] for f in soft_flags)
         return result.model_copy(
             update={
-                "decision": "hold",
+                "decision": DECISION_LEVELS[current_idx - 1],
                 "rationale": f"{result.rationale}\n[RISK WARNING — downgraded: {warning}]",
             }
         )
@@ -305,12 +339,15 @@ def apply_risk_override(result: DecisionOutput, flags: list[dict]) -> DecisionOu
 def decision_node(state: AgentState) -> dict:
     """
     Stage 4: combines technical_node + intel_node + quant_node + risk_node
-    into one structured decision (buy/hold/sell + optional price target)
+    into one structured decision — a 5-level rating (strong_buy ...
+    strong_sell), an optional buy_range and sell_range, and a rationale —
     via structured output, plus a human-readable `analysis` string so
     draft_summary_node keeps working unchanged. If technical and intel
     disagree, the rationale is told to say so explicitly rather than
     silently picking a side; risk flags are enforced afterward by
-    apply_risk_override(), not left to the LLM's discretion.
+    apply_risk_override(), not left to the LLM's discretion. `risk_level`
+    (low/medium/high) is a deterministic lookup from the risk flags, not
+    part of the LLM's output — see compute_risk_level().
     """
     technical = state.get("technical_analysis", "none")
     intel = state.get("intel_analysis", "none")
@@ -324,11 +361,16 @@ def decision_node(state: AgentState) -> dict:
     messages = [
         SystemMessage(
             "You combine a technical read, a news/sentiment read, and a "
-            "quant model's probability estimate into one final call. If "
-            "the technical and intel reads disagree, say so explicitly in "
-            "the rationale instead of silently picking a side. Factor in "
-            "the risk assessment given, but you don't need to enforce its "
-            "severity rules yourself — that's handled separately."
+            "quant model's probability estimate into one final call: a "
+            "5-level rating (strong_buy, buy, hold, sell, strong_sell), "
+            "plus a buy_range (price band worth considering as an entry) "
+            "and a sell_range (price band worth considering as an exit) "
+            "if the data supports specific levels — omit either range "
+            "rather than guessing if it doesn't. If the technical and "
+            "intel reads disagree, say so explicitly in the rationale "
+            "instead of silently picking a side. Factor in the risk "
+            "assessment given, but you don't need to enforce its severity "
+            "rules yourself — that's handled separately."
         ),
         HumanMessage(
             f"Ticker: {state['ticker']}\n"
@@ -336,29 +378,48 @@ def decision_node(state: AgentState) -> dict:
             f"News/intel analysis: {intel}\n"
             f"Quant model signal: {quant_text}\n"
             f"Risk assessment: {risk['summary']}\n\n"
-            "Give a final buy/hold/sell decision with a rationale."
+            "Give a final rating with a rationale."
         ),
     ]
     result: DecisionOutput = _llm.with_structured_output(DecisionOutput).invoke(messages)
     result = apply_risk_override(result, risk["flags"])
+    risk_level = compute_risk_level(risk["flags"])
+
+    def format_range(r: Optional[PriceRange]) -> str:
+        return f"${r.low:.2f}-${r.high:.2f}" if r else "n/a"
+
     analysis_text = (
-        f"Decision: {result.decision.upper()}"
-        + (f" (target: {result.price_target})" if result.price_target is not None else "")
-        + f"\nRationale: {result.rationale}"
+        f"Rating: {result.decision.upper().replace('_', ' ')} (risk: {risk_level})"
+        f"\nBuy range: {format_range(result.buy_range)}"
+        f"\nSell range: {format_range(result.sell_range)}"
+        f"\nRationale: {result.rationale}"
         + f"\n\nTechnical: {technical}\nIntel: {intel}\nQuant: {quant_text}\nRisk: {risk['summary']}"
     )
-    return {"decision": result.model_dump(), "analysis": analysis_text}
+    decision_dict = result.model_dump()
+    decision_dict["risk_level"] = risk_level
+    return {"decision": decision_dict, "analysis": analysis_text}
 
 
 def draft_summary_node(state: AgentState) -> dict:
-    """Stage 5: produces the actual draft text, using the analysis notes."""
+    """
+    Stage 5: produces the actual draft text, using the analysis notes.
+
+    Explicitly told to state decision_node's rating, risk level, and
+    buy/sell ranges rather than soften or omit them — those were
+    computed for a reason and should actually reach the reader, with a
+    disclaimer alongside them rather than instead of them.
+    """
     prompt = (
         f"Ticker: {state['ticker']}\n"
         f"Price summary: {state.get('price_summary', 'unavailable')}\n"
         f"Analysis notes: {state.get('analysis', 'none')}\n\n"
-        "Write a short (3-5 sentence) daily summary: what happened and "
-        "what to watch next. This is informational only, not a buy/sell "
-        "recommendation. End with exactly: 'Status: draft — pending human review.'"
+        "Write a short (4-6 sentence) daily summary: what happened, why, "
+        "and what to watch next. State the rating, risk level, and "
+        "buy/sell ranges from the analysis notes explicitly and clearly — "
+        "don't soften, hedge, or omit them; if a range wasn't given, say "
+        "so rather than inventing one. End with 'This is informational "
+        "only, not financial advice.' on its own line, followed by "
+        "exactly: 'Status: draft — pending human review.'"
     )
     response = _llm.invoke(prompt)
     return {"draft": response.content}
@@ -440,17 +501,17 @@ def build_graph():
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "retrieve_and_grade")
-    # Fan-out: technical, intel, and quant all run off retrieve_and_grade's
-    # output, in the same superstep (LangGraph runs them concurrently) —
-    # none of the three depends on either of the others. Fan-in: risk only
-    # runs once all three have completed, since it needs their reads to
-    # know what it might be overriding. decision runs after risk.
+    # Fan-out: technical, intel, quant, and risk all run off
+    # retrieve_and_grade's output, in the same superstep (LangGraph runs
+    # them concurrently) — none of the four depends on any of the others'
+    # output. Fan-in: decision only runs once all four have completed.
     graph.add_edge("retrieve_and_grade", "technical")
     graph.add_edge("retrieve_and_grade", "intel")
     graph.add_edge("retrieve_and_grade", "quant")
-    graph.add_edge("technical", "risk")
-    graph.add_edge("intel", "risk")
-    graph.add_edge("quant", "risk")
+    graph.add_edge("retrieve_and_grade", "risk")
+    graph.add_edge("technical", "decision")
+    graph.add_edge("intel", "decision")
+    graph.add_edge("quant", "decision")
     graph.add_edge("risk", "decision")
     graph.add_edge("decision", "draft_summary")
     graph.add_edge("draft_summary", "human_checkpoint")

@@ -15,11 +15,8 @@ HTTP request has no terminal to block on. This splits the single
 ```mermaid
 flowchart TD
     A[ingest] --> B[retrieve_and_grade]
-    B --> T[technical]
-    B --> I[intel]
-    T --> R[risk]
-    I --> R
-    R --> DEC[decision]
+    B --> M["[technical, intel, quant, risk]\n(parallel — see multi_agent_architecture.md)"]
+    M --> DEC[decision]
     DEC --> D[draft_summary]
     D --> E["human_checkpoint\n(blocks on input())"]
     E -->|approved| F[log_and_notify]
@@ -38,10 +35,8 @@ rejects.
 flowchart TD
     subgraph R1["Request 1 — POST /analyze {ticker}"]
         A[ingest] --> B[retrieve_and_grade]
-        B --> T[technical]
-        B --> I[intel]
-        T --> DEC[decision]
-        I --> DEC
+        B --> M["[technical, intel, quant, risk]\n(parallel)"]
+        M --> DEC[decision]
         DEC --> D[draft_summary]
         D --> STORE[("save state\nkeyed by session_id")]
         STORE --> RESP1["response: {session_id, draft}"]

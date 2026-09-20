@@ -1,12 +1,12 @@
 # Daily Stock Analysis Agent
 
 A multi-agent pipeline that ingests price + news data for a ticker, runs a
-corrective-RAG retrieval step, splits analysis across parallel technical,
-intel, and quant agents (the quant agent being a trained LightGBM classifier
-with an AutoARIMA forecast as one of its features), screens the
-result through a dedicated risk agent, combines everything into a structured
-buy/hold/sell decision, and stops for human approval before anything is
-logged or sent out.
+corrective-RAG retrieval step, then fans out to four independent parallel
+agents — technical (price action), intel (news), quant (a trained LightGBM
+classifier with an AutoARIMA forecast as one of its features), and risk
+(insider activity, earnings/regulatory risk, valuation anomalies) — before
+combining everything into a structured buy/hold/sell decision, and stopping
+for human approval before anything is logged or sent out.
 
 Every module below is implemented, not a stub — the one exception is
 `agent/tools.py`'s `check_forecast_anomaly`, an optional forecasting/anomaly
@@ -29,7 +29,7 @@ daily-stock-agent/
 │   ├── tools.py                 # Price summary + news lookup tools, used by ingest_node
 │   ├── memory.py               # Conversation history
 │   └── graph.py                 # LangGraph pipeline: ingest → retrieve/grade →
-│                                   [technical, intel, quant] (parallel) → risk
+│                                   [technical, intel, quant, risk] (parallel)
 │                                   → decision → draft → human checkpoint → notify
 ├── ml/
 │   ├── autoarima_forecast.py   # 5-day return forecast via Nixtla's AutoARIMA
@@ -125,12 +125,12 @@ step, `agent/graph.py`'s `quant_node` still works — it just returns
 python -m agent.graph AAPL
 ```
 Runs the full pipeline: ingest → retrieve & grade → `technical` + `intel`
-+ `quant` (run in parallel — technical reasons over price data only,
-intel over retrieved news only, quant runs the trained LightGBM model
-from step 6) → `risk` (fans in from all three; screens for insider
-activity, earnings/regulatory risk, and P/E-P/B valuation anomalies) →
-`decision` (combines everything into a structured buy/hold/sell + price
-target via `DecisionOutput`, with `risk`'s hard/soft flags enforced by
++ `quant` + `risk` (all four run in parallel — technical reasons over
+price data only, intel over retrieved news only, quant runs the trained
+LightGBM model from step 6, risk runs its own risk-focused search +
+fundamentals check independently of the other three) → `decision`
+(combines all four into a structured buy/hold/sell + price target via
+`DecisionOutput`, with `risk`'s hard/soft flags enforced by
 `apply_risk_override()` — see `docs/multi_agent_architecture.md`) → draft
 summary → human checkpoint → log & notify. `human_checkpoint_node` pauses
 for a y/n input in your terminal — that's the approval gate. Reject twice

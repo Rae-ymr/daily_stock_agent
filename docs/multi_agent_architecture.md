@@ -13,20 +13,25 @@ flowchart TD
     B --> T["technical\n(price data only)"]
     B --> I["intel\n(retrieved news only)"]
     B --> Q["quant\n(LightGBM + AutoARIMA forecast)"]
-    T --> R["risk\n(sees technical + intel + quant)"]
-    I --> R
-    Q --> R
-    R --> DEC["decision\n(structured buy/hold/sell)"]
+    B --> R["risk\n(own RAG query + fundamentals)"]
+    T --> DEC["decision\n(structured buy/hold/sell)"]
+    I --> DEC
+    Q --> DEC
+    R --> DEC
     DEC --> D[draft_summary]
     D --> E[human_checkpoint]
     E --> F[log_and_notify]
 ```
 
-`technical`, `intel`, and `quant` run in the same LangGraph superstep —
-genuinely parallel, not just adjacent in the code — because none of the
-three depends on either of the others' output. `risk` fans in from all
-three (it needs their reads to know what it might be overriding) before
-`decision` runs.
+`technical`, `intel`, `quant`, and `risk` all run in the same LangGraph
+superstep — genuinely parallel, not just adjacent in the code — because
+none of the four depends on any of the others' output. `decision` fans
+in from all four.
+
+Risk detection doesn't need the other three agents' conclusions to do
+its job (see "Why risk doesn't need to run after the others" below), so
+there's no reason to gate it behind them — four independent specialist
+reads happen concurrently, one decision-maker synthesizes all four.
 
 ## What each node is responsible for
 
@@ -35,15 +40,31 @@ three (it needs their reads to know what it might be overriding) before
 | `technical_node` | `price_summary`, `technical_indicators` (MA crossover, RSI, MACD, Bollinger width, volatility, volume change) | news, market data | `technical_analysis` (free text) |
 | `intel_node` | `retrieved_context` (corrective-RAG news) | price data | `intel_analysis` (free text) |
 | `quant_node` | trained LightGBM model + live feature row (see below) | news, LLM reasoning | `quant_signal` (`{probability_up, features}`, or `None` if untrained) |
-| `risk_node` | `technical_analysis`, `intel_analysis`, `quant_signal`, a risk-focused RAG query, fundamentals (P/E, P/B) | — | `risk_assessment` (`RiskAssessment`: list of `RiskFlag` + summary) |
+| `risk_node` | its own risk-focused RAG query, fundamentals (P/E, P/B) | technical/intel/quant's conclusions | `risk_assessment` (`RiskAssessment`: list of `RiskFlag` + summary) |
 | `decision_node` | all of the above | — | `decision` (structured `DecisionOutput`) + `analysis` (text, for `draft_summary_node`) |
 
 `technical_node` and `intel_node` are deliberately scoped to *not* see
 each other's domain — each is told explicitly not to reference the
 other's kind of signal. `quant_node` is a different *kind* of signal
 entirely — not an LLM call at all, see below. `decision_node` is where
-all reads get combined, and it's told to surface technical/intel
+all four reads get combined, and it's told to surface technical/intel
 disagreement rather than silently picking a side.
+
+## Why risk doesn't need to run after the others
+
+An earlier version of this graph ran `risk_node` sequentially after
+`technical`/`intel`/`quant`, feeding it their outputs as extra context,
+on the theory that a risk agent needs to see what it might be
+overriding. That reasoning doesn't hold up: insider activity, earnings
+warnings, regulatory actions, and valuation anomalies are all detected
+from `risk_node`'s *own* data sources (a targeted RAG query + a
+fundamentals fetch) — none of that detection logic changes based on
+what technical or intel concluded. And the actual "override other
+agents' signals" behavior lives in `apply_risk_override()`, which runs
+*after* `decision_node` and acts on the final combined `DecisionOutput`
+— it never needed `risk_node` to have seen the others' intermediate
+reads in the first place. So gating risk behind the other three bought
+nothing but latency; running all four in parallel is strictly better.
 
 ## `quant_node` — a trained model, not an LLM call
 
@@ -94,10 +115,10 @@ that branches on a human's approve/reject decision plus a revision
 counter, not on a model deciding which agent to call next.
 
 A **supervisor** pattern would have a dedicated LLM node deciding, per
-run, which of `technical`/`intel`/`risk` to invoke and in what order,
-with workers handing control back to the supervisor after each step.
-This project doesn't need that: every run needs the same fixed set of
-signals (price action, news, risk) in the same order, so a static graph
+run, which of `technical`/`intel`/`quant`/`risk` to invoke, with workers
+handing control back to the supervisor after each step. This project
+doesn't need that: every run needs the same fixed set of signals (price
+action, news, a quant model's read, risk) every time, so a static graph
 is cheaper, easier to test, and easier to debug (a failure is always
 "stage X broke," never "the supervisor routed to the wrong agent").
 Supervisor-style dynamic routing would earn its complexity if different
@@ -107,30 +128,46 @@ doesn't have that variation.
 ## Final output — `DecisionOutput`
 
 ```python
+DECISION_LEVELS = ["strong_sell", "sell", "hold", "buy", "strong_buy"]
+
+class PriceRange(BaseModel):
+    low: float
+    high: float
+
 class DecisionOutput(BaseModel):
-    decision: Literal["buy", "hold", "sell"]
-    price_target: Optional[float]
+    decision: Literal["strong_buy", "buy", "hold", "sell", "strong_sell"]
+    buy_range: Optional[PriceRange]   # entry price band, if the analysis supports one
+    sell_range: Optional[PriceRange]  # exit/take-profit price band, if supported
     rationale: str
 ```
 
 Produced via `with_structured_output`, not parsed out of free text — the
-buy/hold/sell signal and price target are always machine-readable.
-`state["decision"]` (this, as a dict) is what `POST /analyze` returns
-alongside the draft.
+rating and price ranges are always machine-readable, not something that
+has to be scraped out of prose. `state["decision"]` (this dict, plus a
+`risk_level` key merged in by `decision_node`) is what `POST /analyze`
+returns alongside the draft, and what `draft_summary_node` is told to
+state explicitly rather than hedge around.
 
 ## Risk override — two-level severity
 
 `risk_node` can emit `RiskFlag`s with `severity` of:
-- **soft** — downgrades a `buy` to `hold` and adds a visible warning to
-  `rationale`.
-- **hard** — vetoes a `buy` down to `hold` outright, *if*
-  `RISK_OVERRIDE_ENABLED` (env var, default `true`).
+- **soft** — downgrades the decision one level on `DECISION_LEVELS`
+  (e.g. `strong_buy` → `buy`) and adds a visible warning to `rationale`.
+- **hard** — forces the decision down to at most `sell`, *if*
+  `RISK_OVERRIDE_ENABLED` (env var, default `true`) — a hard risk finding
+  should read as "high risk, sell," not a neutral "hold."
 
-This is enforced by `apply_risk_override()` **after** `decision_node`'s
-LLM call, not inside the prompt — the override is guaranteed by code,
-not something the model is merely asked to remember to apply. Non-buy
-decisions (`hold`/`sell`) pass through unchanged; there's nothing to
-downgrade or veto in those.
+Both are no-ops once the decision is already at the relevant floor
+(`strong_sell` for soft, `sell`/`strong_sell` for hard) — there's nothing
+further to downgrade or veto. `risk_level` (`low`/`medium`/`high`,
+surfaced alongside `decision` for display) is a **deterministic lookup**
+from the flags' severities via `compute_risk_level()` — not an LLM
+judgment call, since `RiskFlag.severity` already encodes exactly this.
+
+Both the override and the risk-level lookup are applied by
+`apply_risk_override()`/`compute_risk_level()` **after** `decision_node`'s
+LLM call, not inside the prompt — guaranteed by code, not something the
+model is merely asked to remember to apply.
 
 ## Known simplifications (staged — not gaps to be surprised by)
 

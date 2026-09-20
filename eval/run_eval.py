@@ -25,6 +25,7 @@ from agent.graph import (
     draft_summary_node,
     ingest_node,
     intel_node,
+    quant_node,
     retrieve_and_grade_node,
     risk_node,
     technical_node,
@@ -54,6 +55,7 @@ def run_agent(ticker: str) -> dict:
     state.update(retrieve_and_grade_node(state))
     state.update(technical_node(state))
     state.update(intel_node(state))
+    state.update(quant_node(state))
     state.update(risk_node(state))
     state.update(decision_node(state))
     state.update(draft_summary_node(state))

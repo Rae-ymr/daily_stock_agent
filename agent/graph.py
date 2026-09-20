@@ -1,12 +1,13 @@
 """
 Wires the pipeline stages together as a LangGraph StateGraph:
-  ingest -> retrieve_and_grade -> [technical, intel] (parallel) -> decision
-  -> draft_summary -> human_checkpoint -> approved: log_and_notify
-                                           rejected: back to draft_summary
-                                           (up to 2 revisions)
+  ingest -> retrieve_and_grade -> [technical, intel, quant] (parallel)
+  -> risk -> decision -> draft_summary -> human_checkpoint
+  -> approved: log_and_notify
+     rejected: back to draft_summary (up to 2 revisions)
 
-technical_node and intel_node run in the same superstep, fanning out from
-retrieve_and_grade and fanning back in at decision_node — see build_graph().
+technical_node, intel_node, and quant_node run in the same superstep,
+fanning out from retrieve_and_grade and fanning back in at risk_node —
+see build_graph().
 
 Run standalone:
     python -m agent.graph AAPL
@@ -25,7 +26,8 @@ from pydantic import BaseModel, Field
 from agent.llm import get_chat_llm
 from agent.retrieval import retrieve_with_retry
 from agent.tools import get_price_summary, get_recent_news
-from data.ingest_prices import fetch_fundamentals
+from data.ingest_prices import fetch_fundamentals, fetch_technical_indicators
+from ml.predict import predict_5d_up_probability
 
 _llm = get_chat_llm()
 
@@ -71,10 +73,12 @@ class AgentState(TypedDict):
     ticker: str
     store: Optional[object]
     price_summary: str
+    technical_indicators: dict
     news: list[dict]
     retrieved_context: list[dict]
     technical_analysis: str
     intel_analysis: str
+    quant_signal: Optional[dict]
     risk_assessment: Optional[dict]
     decision: Optional[dict]
     analysis: str
@@ -84,10 +88,11 @@ class AgentState(TypedDict):
 
 
 def ingest_node(state: AgentState) -> dict:
-    """Stage 1: pull price + news data for the ticker."""
+    """Stage 1: pull price + technical indicators + news data for the ticker."""
     ticker = state["ticker"]
     return {
         "price_summary": get_price_summary.invoke({"ticker": ticker}),
+        "technical_indicators": fetch_technical_indicators(ticker),
         "news": get_recent_news.invoke({"ticker": ticker}),
     }
 
@@ -103,24 +108,45 @@ def retrieve_and_grade_node(state: AgentState) -> dict:
 
 def technical_node(state: AgentState) -> dict:
     """
-    Stage 3a: reasons over price_summary only — no news, no market context.
-    Runs in parallel with intel_node; both feed decision_node. Deliberately
-    scoped to price data alone so its read isn't contaminated by sentiment.
+    Stage 3a: reasons over price_summary + technical_indicators only — no
+    news, no market context. Runs in parallel with intel_node; both feed
+    decision_node (via risk_node). Deliberately scoped to price data alone
+    so its read isn't contaminated by sentiment.
 
-    v1: works off price_summary as-is (5-day % change). Real moving
-    averages / volume / support-resistance levels are the planned next
-    pass, once this parallel wiring is confirmed working end-to-end.
+    Indicators (from data/ingest_prices.py's fetch_technical_indicators):
+    5/20-day MA crossover, RSI(14), MACD(12/26/9), Bollinger Band width,
+    20-day volatility, and volume change vs. the 20-day average — computed
+    directly from OHLCV data, not by the LLM.
     """
+    indicators = state.get("technical_indicators") or {}
+    if indicators:
+        indicators_text = (
+            f"MA5={indicators.get('ma5')}, MA20={indicators.get('ma20')}, "
+            f"crossover={indicators.get('ma_crossover')}, "
+            f"RSI(14)={indicators.get('rsi_14')}, "
+            f"MACD={indicators.get('macd')} "
+            f"(signal={indicators.get('macd_signal')}, "
+            f"histogram={indicators.get('macd_histogram')}), "
+            f"Bollinger Band width={indicators.get('bollinger_band_width_pct')}%, "
+            f"20-day volatility={indicators.get('volatility_20d_pct')}%, "
+            f"volume change vs. 20-day avg={indicators.get('volume_change_pct')}%"
+        )
+    else:
+        indicators_text = "unavailable (insufficient price history)"
+
     messages = [
         SystemMessage(
-            "You are a technical analyst. Judge only the price action "
-            "given — trend and momentum, and a rough support or resistance "
-            "level if the data implies one. Do not reference news or "
-            "sentiment; that's a separate analyst's job."
+            "You are a technical analyst. Judge only the price action and "
+            "indicators given — trend and momentum (moving-average "
+            "crossover, MACD), overbought/oversold signal (RSI), "
+            "volatility/risk context (Bollinger Band width, 20-day "
+            "volatility), and whether volume confirms the move. Do not "
+            "reference news or sentiment; that's a separate analyst's job."
         ),
         HumanMessage(
             f"Ticker: {state['ticker']}\n"
-            f"Price summary: {state.get('price_summary', 'unavailable')}\n\n"
+            f"Price summary: {state.get('price_summary', 'unavailable')}\n"
+            f"Technical indicators: {indicators_text}\n\n"
             "Give a short technical read."
         ),
     ]
@@ -153,6 +179,25 @@ def intel_node(state: AgentState) -> dict:
     ]
     response = _llm.invoke(messages)
     return {"intel_analysis": response.content}
+
+
+def quant_node(state: AgentState) -> dict:
+    """
+    Stage 3c: runs the trained LightGBM classifier — technical indicators
+    plus an AutoARIMA forecast as features (see ml/features.py) — to get
+    a probability that the 5-day forward return is positive. Runs in
+    parallel with technical_node/intel_node; it's an independent
+    quantitative signal that doesn't depend on either of their outputs.
+
+    This is a genuinely different kind of signal from technical_node:
+    technical_node is an LLM *reasoning in words* over indicator values;
+    quant_node is a trained classifier's *calibrated probability* from
+    the same underlying data plus a classical statistical forecast.
+    Returns quant_signal=None (not an error) if ml/train.py hasn't been
+    run yet — downstream nodes treat a missing quant signal as "no
+    opinion."
+    """
+    return {"quant_signal": predict_5d_up_probability(state["ticker"])}
 
 
 def risk_node(state: AgentState) -> dict:
@@ -189,6 +234,12 @@ def risk_node(state: AgentState) -> dict:
     news_text = "\n".join(f"- {c['content']}" for c in risk_context) or "none found"
 
     fundamentals = fetch_fundamentals(state["ticker"])
+    quant = state.get("quant_signal")
+    quant_text = (
+        f"{quant['probability_up']:.0%} probability of a positive 5-day return"
+        if quant
+        else "unavailable (model not trained — python -m ml.train)"
+    )
 
     messages = [
         SystemMessage(
@@ -204,6 +255,7 @@ def risk_node(state: AgentState) -> dict:
             f"Ticker: {state['ticker']}\n"
             f"Technical read: {state.get('technical_analysis', 'none')}\n"
             f"Intel read: {state.get('intel_analysis', 'none')}\n"
+            f"Quant model signal: {quant_text}\n"
             f"Risk-focused news search:\n{news_text}\n"
             f"Fundamentals: trailing P/E={fundamentals.get('trailing_pe')}, "
             f"forward P/E={fundamentals.get('forward_pe')}, "
@@ -252,9 +304,9 @@ def apply_risk_override(result: DecisionOutput, flags: list[dict]) -> DecisionOu
 
 def decision_node(state: AgentState) -> dict:
     """
-    Stage 4: combines technical_node + intel_node + risk_node into one
-    structured decision (buy/hold/sell + optional price target) via
-    structured output, plus a human-readable `analysis` string so
+    Stage 4: combines technical_node + intel_node + quant_node + risk_node
+    into one structured decision (buy/hold/sell + optional price target)
+    via structured output, plus a human-readable `analysis` string so
     draft_summary_node keeps working unchanged. If technical and intel
     disagree, the rationale is told to say so explicitly rather than
     silently picking a side; risk flags are enforced afterward by
@@ -263,18 +315,26 @@ def decision_node(state: AgentState) -> dict:
     technical = state.get("technical_analysis", "none")
     intel = state.get("intel_analysis", "none")
     risk = state.get("risk_assessment") or {"flags": [], "summary": "none"}
+    quant = state.get("quant_signal")
+    quant_text = (
+        f"{quant['probability_up']:.0%} probability of a positive 5-day return"
+        if quant
+        else "unavailable (model not trained — python -m ml.train)"
+    )
     messages = [
         SystemMessage(
-            "You combine a technical read and a news/sentiment read into "
-            "one final call. If they disagree, say so explicitly in the "
-            "rationale instead of silently picking a side. Factor in the "
-            "risk assessment given, but you don't need to enforce its "
+            "You combine a technical read, a news/sentiment read, and a "
+            "quant model's probability estimate into one final call. If "
+            "the technical and intel reads disagree, say so explicitly in "
+            "the rationale instead of silently picking a side. Factor in "
+            "the risk assessment given, but you don't need to enforce its "
             "severity rules yourself — that's handled separately."
         ),
         HumanMessage(
             f"Ticker: {state['ticker']}\n"
             f"Technical analysis: {technical}\n"
             f"News/intel analysis: {intel}\n"
+            f"Quant model signal: {quant_text}\n"
             f"Risk assessment: {risk['summary']}\n\n"
             "Give a final buy/hold/sell decision with a rationale."
         ),
@@ -285,7 +345,7 @@ def decision_node(state: AgentState) -> dict:
         f"Decision: {result.decision.upper()}"
         + (f" (target: {result.price_target})" if result.price_target is not None else "")
         + f"\nRationale: {result.rationale}"
-        + f"\n\nTechnical: {technical}\nIntel: {intel}\nRisk: {risk['summary']}"
+        + f"\n\nTechnical: {technical}\nIntel: {intel}\nQuant: {quant_text}\nRisk: {risk['summary']}"
     )
     return {"decision": result.model_dump(), "analysis": analysis_text}
 
@@ -371,6 +431,7 @@ def build_graph():
     graph.add_node("retrieve_and_grade", retrieve_and_grade_node)
     graph.add_node("technical", technical_node)
     graph.add_node("intel", intel_node)
+    graph.add_node("quant", quant_node)
     graph.add_node("risk", risk_node)
     graph.add_node("decision", decision_node)
     graph.add_node("draft_summary", draft_summary_node)
@@ -379,14 +440,17 @@ def build_graph():
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "retrieve_and_grade")
-    # Fan-out: technical and intel both run off retrieve_and_grade's output,
-    # in the same superstep (LangGraph runs them concurrently). Fan-in:
-    # risk only runs once both have completed, since it needs their reads
-    # to know what it might be overriding. decision runs after risk.
+    # Fan-out: technical, intel, and quant all run off retrieve_and_grade's
+    # output, in the same superstep (LangGraph runs them concurrently) —
+    # none of the three depends on either of the others. Fan-in: risk only
+    # runs once all three have completed, since it needs their reads to
+    # know what it might be overriding. decision runs after risk.
     graph.add_edge("retrieve_and_grade", "technical")
     graph.add_edge("retrieve_and_grade", "intel")
+    graph.add_edge("retrieve_and_grade", "quant")
     graph.add_edge("technical", "risk")
     graph.add_edge("intel", "risk")
+    graph.add_edge("quant", "risk")
     graph.add_edge("risk", "decision")
     graph.add_edge("decision", "draft_summary")
     graph.add_edge("draft_summary", "human_checkpoint")

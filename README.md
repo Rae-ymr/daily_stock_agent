@@ -1,15 +1,17 @@
 # Daily Stock Analysis Agent
 
 A multi-agent pipeline that ingests price + news data for a ticker, runs a
-corrective-RAG retrieval step, splits analysis across parallel technical and
-intel agents, screens the result through a dedicated risk agent, combines
-everything into a structured buy/hold/sell decision, and stops for human
-approval before anything is logged or sent out.
+corrective-RAG retrieval step, splits analysis across parallel technical,
+intel, and quant agents (the quant agent being a trained LightGBM classifier
+with an AutoARIMA forecast as one of its features), screens the
+result through a dedicated risk agent, combines everything into a structured
+buy/hold/sell decision, and stops for human approval before anything is
+logged or sent out.
 
 Every module below is implemented, not a stub — the one exception is
 `agent/tools.py`'s `check_forecast_anomaly`, an optional forecasting/anomaly
 hook left for later. See `docs/multi_agent_architecture.md` for how the
-technical/intel/risk/decision agents fit together, and
+technical/intel/quant/risk/decision agents fit together, and
 `docs/human_checkpoint_flow.md` for the design of the human-approval step
 (CLI `input()` vs. the API's `/analyze` + `/approve` split).
 
@@ -18,7 +20,8 @@ technical/intel/risk/decision agents fit together, and
 ```
 daily-stock-agent/
 ├── data/
-│   ├── ingest_prices.py      # Pulls price history + fundamentals (P/E, P/B) via yfinance
+│   ├── ingest_prices.py      # Price history + fundamentals (P/E, P/B) + technical
+│   │                             indicators (MA crossover, RSI, MACD, Bollinger, volume) via yfinance
 │   └── ingest_news.py        # Pulls news headlines via Tavily
 ├── agent/
 │   ├── llm.py                    # Picks the chat LLM (Groq default, OpenAI optional)
@@ -26,8 +29,13 @@ daily-stock-agent/
 │   ├── tools.py                 # Price summary + news lookup tools, used by ingest_node
 │   ├── memory.py               # Conversation history
 │   └── graph.py                 # LangGraph pipeline: ingest → retrieve/grade →
-│                                   [technical, intel] (parallel) → risk → decision
-│                                   → draft → human checkpoint → notify
+│                                   [technical, intel, quant] (parallel) → risk
+│                                   → decision → draft → human checkpoint → notify
+├── ml/
+│   ├── autoarima_forecast.py   # 5-day return forecast via Nixtla's AutoARIMA
+│   ├── features.py               # Shared feature-building — same function trains and serves
+│   ├── train.py                   # Builds a pooled panel across STOCK_LIST, trains LightGBM
+│   └── predict.py                 # Loads the trained model, scores one ticker (used by quant_node)
 ├── eval/
 │   ├── test_set.json          # Labeled ticker/question/expected_answer cases
 │   └── run_eval.py             # Runs the pipeline per case, scores by embedding similarity
@@ -97,15 +105,31 @@ python -m agent.memory
 ```
 Sanity check that the memory object stores and returns messages correctly.
 
-### 6. `agent/graph.py` — the full pipeline
+### 6. `ml/train.py` — trains the quant signal (optional but recommended)
+```bash
+python -m ml.train
+```
+Pools price history across `STOCK_LIST` (5 years, sampled every 5th day),
+builds a feature row per sample (technical indicators + an AutoARIMA
+forecast — see `ml/features.py`), and trains a LightGBM classifier to
+predict "will the 5-day forward return be positive?". Splits train/test
+**by date**, not randomly (a random split would leak future rows into
+training — see `docs/multi_agent_architecture.md`). Takes a few minutes
+— AutoARIMA fits once per sampled row (an order search, not a lookup).
+Saves to `ml/model.pkl` (gitignored; not committed). If you skip this
+step, `agent/graph.py`'s `quant_node` still works — it just returns
+`quant_signal=None`, which downstream nodes treat as "no opinion."
+
+### 7. `agent/graph.py` — the full pipeline
 ```bash
 python -m agent.graph AAPL
 ```
 Runs the full pipeline: ingest → retrieve & grade → `technical` + `intel`
-(run in parallel — one reasoning over price data only, the other over
-retrieved news only) → `risk` (fans in from both; screens for insider
++ `quant` (run in parallel — technical reasons over price data only,
+intel over retrieved news only, quant runs the trained LightGBM model
+from step 6) → `risk` (fans in from all three; screens for insider
 activity, earnings/regulatory risk, and P/E-P/B valuation anomalies) →
-`decision` (combines all three into a structured buy/hold/sell + price
+`decision` (combines everything into a structured buy/hold/sell + price
 target via `DecisionOutput`, with `risk`'s hard/soft flags enforced by
 `apply_risk_override()` — see `docs/multi_agent_architecture.md`) → draft
 summary → human checkpoint → log & notify. `human_checkpoint_node` pauses
@@ -113,7 +137,7 @@ for a y/n input in your terminal — that's the approval gate. Reject twice
 and it finalizes as rejected instead of drafting a third time (see
 `route_after_checkpoint`).
 
-### 7. `eval/run_eval.py`
+### 8. `eval/run_eval.py`
 ```bash
 python -m eval.run_eval
 ```
@@ -123,7 +147,7 @@ automated eval), and scores the draft against `expected_answer` via
 embedding cosine similarity. Cases still holding placeholder text are
 skipped, not scored as 0.
 
-### 8. `app/main.py` — wraps the pipeline behind an API
+### 9. `app/main.py` — wraps the pipeline behind an API
 Needs Redis reachable (holds draft state between `/analyze` and `/approve`
 — see `docs/human_checkpoint_flow.md`). Run one locally first:
 ```bash
@@ -141,7 +165,7 @@ Then open `http://127.0.0.1:8000/docs` to test the endpoints interactively:
 - `GET /eval` — not implemented yet; currently returns a placeholder status.
 - `GET /health` — liveness check.
 
-### 9. Docker
+### 10. Docker
 ```bash
 docker compose up --build
 ```

@@ -77,15 +77,29 @@ def approve(session_id: str, req: ApproveRequest):
         raise HTTPException(status_code=404, detail="Session not found or expired")
 
     if req.approved:
-        log_and_notify_node({"ticker": state["ticker"], "approved": True, "draft": state["draft"]})
+        result = log_and_notify_node(
+            {"ticker": state["ticker"], "approved": True, "draft": state["draft"]}
+        )
         delete_session(session_id)
-        return {"session_id": session_id, "status": "final", "approved": True, "draft": state["draft"]}
+        return {
+            "session_id": session_id,
+            "status": "final",
+            "approved": True,
+            "draft": result["draft"],
+        }
 
     revision_count = state["revision_count"] + 1
     if revision_count >= MAX_REVISIONS:
-        log_and_notify_node({"ticker": state["ticker"], "approved": False, "draft": state["draft"]})
+        result = log_and_notify_node(
+            {"ticker": state["ticker"], "approved": False, "draft": state["draft"]}
+        )
         delete_session(session_id)
-        return {"session_id": session_id, "status": "final", "approved": False, "draft": state["draft"]}
+        return {
+            "session_id": session_id,
+            "status": "final",
+            "approved": False,
+            "draft": result["draft"],
+        }
 
     redraft = draft_summary_node(
         {

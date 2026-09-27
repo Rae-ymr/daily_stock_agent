@@ -45,6 +45,9 @@ class PriceRange(BaseModel):
 # Ordered bearish -> bullish so apply_risk_override can shift a decision
 # by index rather than special-casing every level.
 DECISION_LEVELS = ["strong_sell", "sell", "hold", "buy", "strong_buy"]
+PENDING_REVIEW_STATUS = "Status: draft — pending human review."
+APPROVED_STATUS = "Status: approved."
+REJECTED_STATUS = "Status: rejected — not approved."
 
 
 class DecisionOutput(BaseModel):
@@ -430,7 +433,7 @@ def draft_summary_node(state: AgentState) -> dict:
         "don't soften, hedge, or omit them; if a range wasn't given, say "
         "so rather than inventing one. End with 'This is informational "
         "only, not financial advice.' on its own line, followed by "
-        "exactly: 'Status: draft — pending human review.'"
+        f"exactly: '{PENDING_REVIEW_STATUS}'"
     )
     response = _llm.invoke(prompt)
     return {"draft": response.content}
@@ -488,12 +491,22 @@ def send_notification_email(ticker: str, draft: str) -> None:
     print(f"Notification emailed to {to_addr}")
 
 
+def finalize_draft_status(draft: str, approved: bool) -> str:
+    """Replaces the draft-only status before a final response is sent."""
+    final_status = APPROVED_STATUS if approved else REJECTED_STATUS
+    if PENDING_REVIEW_STATUS in draft:
+        return draft.replace(PENDING_REVIEW_STATUS, final_status)
+    return f"{draft.rstrip()}\n{final_status}"
+
+
 def log_and_notify_node(state: AgentState) -> dict:
     """Stage 7: logs the outcome and emails the draft if it was approved."""
-    print(f"Logged. Approved: {state.get('approved')}")
-    if state.get("approved"):
-        send_notification_email(state["ticker"], state.get("draft", ""))
-    return {}
+    approved = bool(state.get("approved"))
+    final_draft = finalize_draft_status(state.get("draft", ""), approved)
+    print(f"Logged. Approved: {approved}")
+    if approved:
+        send_notification_email(state["ticker"], final_draft)
+    return {"draft": final_draft}
 
 
 def _add_analysis_graph(graph: StateGraph) -> None:

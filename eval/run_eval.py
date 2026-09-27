@@ -20,16 +20,8 @@ from typing import Optional
 import numpy as np
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from agent.graph import (
-    decision_node,
-    draft_summary_node,
-    ingest_node,
-    intel_node,
-    quant_node,
-    retrieve_and_grade_node,
-    risk_node,
-    technical_node,
-)
+from agent.graph import run_analysis
+
 TEST_SET_PATH = Path(__file__).parent / "test_set.json"
 PLACEHOLDER_MARKER = "REPLACE WITH"
 
@@ -42,21 +34,11 @@ def load_test_set() -> list[dict]:
 
 def run_agent(ticker: str) -> dict:
     """
-    Runs the pipeline through draft_summary_node, one stage at a time.
-    Deliberately skips human_checkpoint_node — it blocks on terminal
-    input for approval, which isn't something an automated eval loop
-    should hit. Eval only needs the drafted analysis, not the approval.
+    Runs the compiled analysis graph through draft_summary_node.
+    This graph deliberately omits human_checkpoint_node because terminal
+    approval is not meaningful in an automated eval loop.
     """
-    state = {"ticker": ticker}
-    state.update(ingest_node(state))
-    state.update(retrieve_and_grade_node(state))
-    state.update(technical_node(state))
-    state.update(intel_node(state))
-    state.update(quant_node(state))
-    state.update(risk_node(state))
-    state.update(decision_node(state))
-    state.update(draft_summary_node(state))
-    return state
+    return run_analysis(ticker)
 
 
 def score_answer(expected: str, actual: str) -> Optional[float]:

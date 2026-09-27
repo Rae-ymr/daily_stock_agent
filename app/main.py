@@ -13,15 +13,9 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from agent.graph import (
-    decision_node,
     draft_summary_node,
-    ingest_node,
-    intel_node,
     log_and_notify_node,
-    quant_node,
-    retrieve_and_grade_node,
-    risk_node,
-    technical_node,
+    run_analysis,
 )
 from app.heatmap import build_heatmap_html
 from app.session_store import create_session, delete_session, load_session, update_session
@@ -51,15 +45,7 @@ def analyze(req: AnalyzeRequest):
     draft"). The draft is stashed in Redis under a session_id; call
     POST /approve/{session_id} with the human's decision to continue.
     """
-    state = {"ticker": req.ticker}
-    state.update(ingest_node(state))
-    state.update(retrieve_and_grade_node(state))
-    state.update(technical_node(state))
-    state.update(intel_node(state))
-    state.update(quant_node(state))
-    state.update(risk_node(state))
-    state.update(decision_node(state))
-    state.update(draft_summary_node(state))
+    state = run_analysis(req.ticker)
 
     session_id = create_session(
         {

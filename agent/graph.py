@@ -496,9 +496,8 @@ def log_and_notify_node(state: AgentState) -> dict:
     return {}
 
 
-def build_graph():
-    """Assembles and compiles the StateGraph. Call once, reuse the result."""
-    graph = StateGraph(AgentState)
+def _add_analysis_graph(graph: StateGraph) -> None:
+    """Adds the shared ingest-through-draft portion of the pipeline."""
     graph.add_node("ingest", ingest_node)
     graph.add_node("retrieve_and_grade", retrieve_and_grade_node)
     graph.add_node("technical", technical_node)
@@ -507,8 +506,6 @@ def build_graph():
     graph.add_node("risk", risk_node)
     graph.add_node("decision", decision_node)
     graph.add_node("draft_summary", draft_summary_node)
-    graph.add_node("human_checkpoint", human_checkpoint_node)
-    graph.add_node("log_and_notify", log_and_notify_node)
 
     graph.set_entry_point("ingest")
     graph.add_edge("ingest", "retrieve_and_grade")
@@ -525,6 +522,23 @@ def build_graph():
     graph.add_edge("quant", "decision")
     graph.add_edge("risk", "decision")
     graph.add_edge("decision", "draft_summary")
+
+
+def build_analysis_graph():
+    """Compiles the ingest-through-draft graph used by HTTP and eval callers."""
+    graph = StateGraph(AgentState)
+    _add_analysis_graph(graph)
+    graph.add_edge("draft_summary", END)
+    return graph.compile()
+
+
+def build_graph():
+    """Compiles the full CLI graph, including interactive human approval."""
+    graph = StateGraph(AgentState)
+    _add_analysis_graph(graph)
+    graph.add_node("human_checkpoint", human_checkpoint_node)
+    graph.add_node("log_and_notify", log_and_notify_node)
+
     graph.add_edge("draft_summary", "human_checkpoint")
     graph.add_conditional_edges(
         "human_checkpoint",
@@ -537,10 +551,19 @@ def build_graph():
 
 
 _compiled_graph = None
+_compiled_analysis_graph = None
+
+
+def run_analysis(ticker: str, store=None) -> dict:
+    """Runs the compiled graph through draft creation without blocking for input."""
+    global _compiled_analysis_graph
+    if _compiled_analysis_graph is None:
+        _compiled_analysis_graph = build_analysis_graph()
+    return _compiled_analysis_graph.invoke({"ticker": ticker, "store": store, "revision_count": 0})
 
 
 def run_pipeline(ticker: str, store=None) -> dict:
-    """Public entry point — used by app/main.py and eval/run_eval.py."""
+    """Runs the full interactive CLI graph, including human approval."""
     global _compiled_graph
     if _compiled_graph is None:
         _compiled_graph = build_graph()

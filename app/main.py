@@ -23,7 +23,6 @@ from agent.graph import (
     risk_node,
     technical_node,
 )
-from agent.retrieval import build_vector_store
 from app.heatmap import build_heatmap_html
 from app.session_store import create_session, delete_session, load_session, update_session
 from data.ingest_prices import fetch_price_history
@@ -54,7 +53,6 @@ def analyze(req: AnalyzeRequest):
     """
     state = {"ticker": req.ticker}
     state.update(ingest_node(state))
-    state["store"] = build_vector_store(state["news"])
     state.update(retrieve_and_grade_node(state))
     state.update(technical_node(state))
     state.update(intel_node(state))

@@ -30,8 +30,6 @@ from agent.graph import (
     risk_node,
     technical_node,
 )
-from agent.retrieval import build_vector_store
-
 TEST_SET_PATH = Path(__file__).parent / "test_set.json"
 PLACEHOLDER_MARKER = "REPLACE WITH"
 
@@ -51,7 +49,6 @@ def run_agent(ticker: str) -> dict:
     """
     state = {"ticker": ticker}
     state.update(ingest_node(state))
-    state["store"] = build_vector_store(state["news"])
     state.update(retrieve_and_grade_node(state))
     state.update(technical_node(state))
     state.update(intel_node(state))

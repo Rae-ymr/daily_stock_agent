@@ -24,7 +24,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from agent.llm import get_chat_llm
-from agent.retrieval import retrieve_with_retry
+from agent.retrieval import build_vector_store, retrieve_with_retry
 from agent.tools import get_price_summary, get_recent_news
 from data.ingest_prices import fetch_fundamentals, fetch_technical_indicators
 from ml.predict import predict_5d_up_probability
@@ -111,12 +111,23 @@ def ingest_node(state: AgentState) -> dict:
 
 
 def retrieve_and_grade_node(state: AgentState) -> dict:
-    """Stage 2: corrective RAG over the news/documents."""
+    """Stage 2: build the news store and run corrective RAG over it.
+
+    A caller may still supply a prebuilt store, but the normal graph path
+    creates one from ingest_node's news so CLI, API, and eval runs all use
+    the same retrieval behavior.
+    """
     store = state.get("store")
     if store is None:
-        return {"retrieved_context": []}
+        news = state.get("news") or []
+        if not news:
+            return {"store": None, "retrieved_context": []}
+        store = build_vector_store(news)
     query = f"What's driving {state['ticker']} recently?"
-    return {"retrieved_context": retrieve_with_retry(query, store)}
+    return {
+        "store": store,
+        "retrieved_context": retrieve_with_retry(query, store),
+    }
 
 
 def technical_node(state: AgentState) -> dict:

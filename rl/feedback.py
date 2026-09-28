@@ -1,8 +1,9 @@
-"""Record, settle, and learn from delayed five-trading-day feedback."""
+"""Record, settle, and retrain LightGBM from delayed five-day feedback."""
 
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import date, timedelta
 from typing import Callable, Optional
 
@@ -10,13 +11,17 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from ml.train import train
 from rl.ledger import PredictionLedger
-from rl.policy import (
-    DEFAULT_POLICY_PATH,
-    OnlineReturnPolicy,
-    clear_policy_cache,
-)
 
+DECISION_ALLOCATIONS = {
+    "strong_sell": 0.0,
+    "sell": 0.25,
+    "hold": 0.5,
+    "buy": 0.75,
+    "strong_buy": 1.0,
+}
+DEFAULT_RETRAIN_MIN_LABELS = int(os.getenv("QUANT_RETRAIN_MIN_LABELS", "5"))
 HistoryFetcher = Callable[[str, date, date], pd.DataFrame]
 
 
@@ -24,30 +29,32 @@ def _fetch_history(ticker: str, start: date, end: date) -> pd.DataFrame:
     return yf.Ticker(ticker).history(start=start.isoformat(), end=end.isoformat())
 
 
-def record_live_prediction(
+def record_live_quant_prediction(
     ticker: str,
     quant_signal: dict,
-    policy_signal: dict,
+    decision: dict,
     *,
     ledger: Optional[PredictionLedger] = None,
 ) -> Optional[str]:
-    """Records the latest market close and the policy's shadow prediction."""
-    features = quant_signal.get("features") if quant_signal else None
-    if not features or not policy_signal:
+    """Persists one quant prediction and the final advice shown that day."""
+    if not quant_signal or not quant_signal.get("features") or not decision:
         return None
+    decision_name = decision["decision"]
+    if decision_name not in DECISION_ALLOCATIONS:
+        raise ValueError(f"Unknown decision: {decision_name}")
+
     history = yf.Ticker(ticker).history(period="5d")
     if history.empty:
         return None
-    latest = history.iloc[-1]
-    prediction_date = history.index[-1].date().isoformat()
     ledger = ledger or PredictionLedger()
     return ledger.record(
         ticker=ticker,
-        prediction_date=prediction_date,
-        entry_price=float(latest["Close"]),
-        features=features,
-        signal=policy_signal,
-        horizon_days=5,
+        prediction_date=history.index[-1].date().isoformat(),
+        entry_price=float(history["Close"].iloc[-1]),
+        features=quant_signal["features"],
+        probability_up=float(quant_signal["probability_up"]),
+        decision=decision_name,
+        allocation=DECISION_ALLOCATIONS[decision_name],
     )
 
 
@@ -81,27 +88,30 @@ def settle_pending_predictions(
             continue
 
         horizon = future_rows.iloc[:horizon_days]
-        exit_price = float(horizon["Close"].iloc[-1])
         entry_price = float(prediction["entry_price"])
+        exit_price = float(horizon["Close"].iloc[-1])
         forward_return = exit_price / entry_price - 1.0
+        label_up = int(forward_return > 0)
+        predicted_up = float(prediction["probability_up"]) >= 0.5
         prices = pd.Series(
             [entry_price, *horizon["Close"].astype(float).tolist()],
             dtype=float,
         )
         future_volatility = float(prices.pct_change().dropna().std(ddof=0))
         allocation = float(prediction["allocation"])
-        transaction_cost = allocation * transaction_cost_bps / 10_000.0
-        risk_penalty = (
-            risk_aversion * allocation**2 * future_volatility**2
+        reward = (
+            allocation * forward_return
+            - allocation * transaction_cost_bps / 10_000.0
+            - risk_aversion * allocation**2 * future_volatility**2
         )
-        reward = allocation * forward_return - transaction_cost - risk_penalty
-        settled_date = horizon.index[-1].date().isoformat()
 
         ledger.settle(
             prediction["id"],
-            settled_date=settled_date,
+            settled_date=horizon.index[-1].date().isoformat(),
             exit_price=exit_price,
             forward_return=forward_return,
+            label_up=label_up,
+            direction_correct=predicted_up == bool(label_up),
             future_volatility=future_volatility,
             reward=reward,
         )
@@ -109,50 +119,54 @@ def settle_pending_predictions(
     return settled_ids
 
 
-def update_policy_from_settled(
+def retrain_quant_from_settled(
     *,
     ledger: Optional[PredictionLedger] = None,
-    policy_path=DEFAULT_POLICY_PATH,
+    min_labels: int = DEFAULT_RETRAIN_MIN_LABELS,
+    force: bool = False,
 ) -> int:
-    """Applies all untrained settled labels, saves, then marks them consumed."""
+    """Batch-retrains LightGBM and consumes settled labels only on success."""
     ledger = ledger or PredictionLedger()
     rows = ledger.untrained_settled()
-    if not rows:
+    if not rows or (len(rows) < min_labels and not force):
         return 0
 
-    policy = OnlineReturnPolicy.load(policy_path)
-    if policy is None:
-        raise RuntimeError(
-            "No bootstrap policy found; run `python -m rl.train_policy` first"
-        )
-    observations = [
-        OnlineReturnPolicy.observation_from_features(row["features"])
+    supplemental = [
+        {
+            **row["features"],
+            "label": int(row["label_up"]),
+            "ticker": row["ticker"],
+            "date": row["prediction_date"],
+        }
         for row in rows
     ]
-    returns = [float(row["forward_return"]) for row in rows]
-    policy.update(observations, returns)
-    policy.save(policy_path)
+    if not train(extra_rows=supplemental):
+        return 0
     ledger.mark_trained([row["id"] for row in rows])
-    clear_policy_cache()
     return len(rows)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Process delayed policy feedback")
+    parser = argparse.ArgumentParser(description="Process delayed quant feedback")
     parser.add_argument(
         "command",
-        choices=("settle", "update", "all"),
+        choices=("settle", "retrain", "all"),
         default="all",
         nargs="?",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Retrain even below QUANT_RETRAIN_MIN_LABELS",
     )
     args = parser.parse_args()
 
     if args.command in {"settle", "all"}:
         settled = settle_pending_predictions()
-        print(f"Settled {len(settled)} prediction(s)")
-    if args.command in {"update", "all"}:
-        updated = update_policy_from_settled()
-        print(f"Updated policy with {updated} prediction(s)")
+        print(f"Settled {len(settled)} quant prediction(s)")
+    if args.command in {"retrain", "all"}:
+        trained = retrain_quant_from_settled(force=args.force)
+        print(f"Retrained LightGBM with {trained} live-feedback label(s)")
 
 
 if __name__ == "__main__":

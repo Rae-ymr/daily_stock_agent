@@ -1,4 +1,4 @@
-"""SQLite ledger for delayed five-trading-day policy feedback."""
+"""SQLite ledger for delayed five-trading-day LightGBM feedback."""
 
 from __future__ import annotations
 
@@ -30,27 +30,27 @@ class PredictionLedger:
         with self._connect() as connection:
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS policy_predictions (
+                CREATE TABLE IF NOT EXISTS quant_predictions (
                     id TEXT PRIMARY KEY,
                     ticker TEXT NOT NULL,
                     prediction_date TEXT NOT NULL,
                     entry_price REAL NOT NULL,
                     horizon_days INTEGER NOT NULL,
                     features_json TEXT NOT NULL,
-                    action TEXT NOT NULL,
+                    probability_up REAL NOT NULL,
+                    decision TEXT NOT NULL,
                     allocation REAL NOT NULL,
-                    predicted_return REAL NOT NULL,
-                    confidence REAL NOT NULL,
-                    model_version INTEGER NOT NULL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     settled_date TEXT,
                     exit_price REAL,
                     forward_return REAL,
+                    label_up INTEGER,
+                    direction_correct INTEGER,
                     future_volatility REAL,
                     reward REAL,
                     trained_at TEXT,
                     created_at TEXT NOT NULL,
-                    UNIQUE(ticker, prediction_date, model_version)
+                    UNIQUE(ticker, prediction_date)
                 )
                 """
             )
@@ -62,12 +62,13 @@ class PredictionLedger:
         prediction_date: str,
         entry_price: float,
         features: dict,
-        signal: dict,
+        probability_up: float,
+        decision: str,
+        allocation: float,
         horizon_days: int = 5,
     ) -> str:
-        """Stores one shadow prediction, idempotently per day/model version."""
+        """Stores the first quant prediction for a ticker/trading date."""
         prediction_id = str(uuid4())
-        created_at = datetime.now(timezone.utc).isoformat()
         values = (
             prediction_id,
             ticker.upper(),
@@ -75,43 +76,39 @@ class PredictionLedger:
             float(entry_price),
             int(horizon_days),
             json.dumps(features, sort_keys=True),
-            signal["action"],
-            float(signal["allocation"]),
-            float(signal["predicted_5d_return"]),
-            float(signal["confidence"]),
-            int(signal["model_version"]),
-            created_at,
+            float(probability_up),
+            decision,
+            float(allocation),
+            datetime.now(timezone.utc).isoformat(),
         )
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT OR IGNORE INTO policy_predictions (
+                INSERT OR IGNORE INTO quant_predictions (
                     id, ticker, prediction_date, entry_price, horizon_days,
-                    features_json, action, allocation, predicted_return,
-                    confidence, model_version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    features_json, probability_up, decision, allocation,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
             row = connection.execute(
                 """
-                SELECT id FROM policy_predictions
-                WHERE ticker = ? AND prediction_date = ? AND model_version = ?
+                SELECT id FROM quant_predictions
+                WHERE ticker = ? AND prediction_date = ?
                 """,
-                (ticker.upper(), prediction_date, int(signal["model_version"])),
+                (ticker.upper(), prediction_date),
             ).fetchone()
         return str(row["id"])
 
     def pending(self) -> list[dict]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM policy_predictions
-                WHERE status = 'pending'
-                ORDER BY prediction_date, ticker
-                """
-            ).fetchall()
-        return [self._decode(row) for row in rows]
+        return self._select(
+            """
+            SELECT * FROM quant_predictions
+            WHERE status = 'pending'
+            ORDER BY prediction_date, ticker
+            """
+        )
 
     def settle(
         self,
@@ -120,21 +117,26 @@ class PredictionLedger:
         settled_date: str,
         exit_price: float,
         forward_return: float,
+        label_up: int,
+        direction_correct: bool,
         future_volatility: float,
         reward: float,
     ) -> None:
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                UPDATE policy_predictions
+                UPDATE quant_predictions
                 SET status = 'settled', settled_date = ?, exit_price = ?,
-                    forward_return = ?, future_volatility = ?, reward = ?
+                    forward_return = ?, label_up = ?, direction_correct = ?,
+                    future_volatility = ?, reward = ?
                 WHERE id = ? AND status = 'pending'
                 """,
                 (
                     settled_date,
                     float(exit_price),
                     float(forward_return),
+                    int(label_up),
+                    int(direction_correct),
                     float(future_volatility),
                     float(reward),
                     prediction_id,
@@ -146,38 +148,39 @@ class PredictionLedger:
                 )
 
     def untrained_settled(self) -> list[dict]:
-        with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT * FROM policy_predictions
-                WHERE status = 'settled' AND trained_at IS NULL
-                ORDER BY settled_date, ticker
-                """
-            ).fetchall()
-        return [self._decode(row) for row in rows]
+        return self._select(
+            """
+            SELECT * FROM quant_predictions
+            WHERE status = 'settled' AND trained_at IS NULL
+            ORDER BY settled_date, ticker
+            """
+        )
 
     def mark_trained(self, prediction_ids: list[str]) -> None:
         if not prediction_ids:
             return
-        trained_at = datetime.now(timezone.utc).isoformat()
         placeholders = ",".join("?" for _ in prediction_ids)
         with self._connect() as connection:
             connection.execute(
                 f"""
-                UPDATE policy_predictions
+                UPDATE quant_predictions
                 SET trained_at = ?
                 WHERE id IN ({placeholders}) AND status = 'settled'
                 """,
-                (trained_at, *prediction_ids),
+                (datetime.now(timezone.utc).isoformat(), *prediction_ids),
             )
 
     def get(self, prediction_id: str) -> Optional[dict]:
+        rows = self._select(
+            "SELECT * FROM quant_predictions WHERE id = ?",
+            (prediction_id,),
+        )
+        return rows[0] if rows else None
+
+    def _select(self, query: str, parameters: tuple = ()) -> list[dict]:
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM policy_predictions WHERE id = ?",
-                (prediction_id,),
-            ).fetchone()
-        return self._decode(row) if row else None
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._decode(row) for row in rows]
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> dict:

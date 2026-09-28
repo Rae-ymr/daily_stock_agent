@@ -38,16 +38,14 @@ daily-stock-agent/
 │   └── predict.py                 # Loads the trained model, scores one ticker (used by quant_node)
 ├── rl/
 │   ├── environment.py             # Offline 5-day contextual-bandit trading environment
-│   ├── policy.py                  # Incremental five-day return policy
-│   ├── train_policy.py            # Historical bootstrap training
-│   ├── ledger.py                  # Persistent SQLite prediction ledger
-│   └── feedback.py                # Five-session settlement + online update CLI
+│   ├── ledger.py                  # Persistent SQLite quant-prediction ledger
+│   └── feedback.py                # Five-session settlement + LightGBM retraining CLI
 ├── eval/
 │   ├── test_set.json          # Labeled ticker/question/expected_answer cases
 │   └── run_eval.py             # Runs the pipeline per case, scores by embedding similarity
 ├── tests/
 │   ├── test_trading_environment.py # Reward and leakage-boundary tests
-│   └── test_online_policy.py       # Policy persistence and delayed-feedback tests
+│   └── test_quant_feedback.py      # Quant settlement and retraining tests
 ├── app/
 │   ├── main.py                  # FastAPI wrapper (/analyze, /approve, /heatmap, /eval, /health)
 │   ├── session_store.py        # Redis-backed session state between /analyze and /approve
@@ -159,26 +157,22 @@ Run its synthetic-data tests with:
 python -m unittest tests.test_trading_environment
 ```
 
-Bootstrap the independent online policy from historical data:
-
-```bash
-python -m rl.train_policy --tickers AAPL,MSFT --period 5y
-```
-
-After that, each API analysis returns a `policy_signal` in shadow mode and
-records it in `rl/predictions.db`. It is visible for evaluation but does
-not affect `decision_node`'s final rating. Run this command after each
-market close (for example, from cron):
+After `python -m ml.train` creates the LightGBM model, each API analysis
+records its quant probability, feature row, and final advice in
+`rl/predictions.db`. Run this command after each market close (for example,
+from cron):
 
 ```bash
 python -m rl.feedback all
 ```
 
 The feedback command settles predictions only after five later trading
-sessions exist, calculates their realized returns, incrementally updates
-`rl/policy.pkl`, and marks each label as consumed so it cannot train twice.
-Both the policy artifact and SQLite ledger are gitignored. Override their
-locations with `RL_POLICY_PATH` and `RL_LEDGER_PATH`.
+sessions exist. It records direction accuracy and reward, then batch-retrains
+the existing LightGBM after five new labels by default. Successfully consumed
+labels are marked so they cannot be added twice. The model and SQLite ledger
+are gitignored. Configure the batch size with `QUANT_RETRAIN_MIN_LABELS`,
+override the database path with `RL_LEDGER_PATH`, or use
+`python -m rl.feedback all --force` to retrain below the threshold.
 
 ### 8. `agent/graph.py` — the full pipeline
 ```bash
@@ -188,8 +182,7 @@ Runs the full pipeline: ingest → retrieve & grade → `technical` + `intel`
 + `quant` + `risk` (all four run in parallel — technical reasons over
 price data only, intel over retrieved news only, quant runs the trained
 LightGBM model from step 6, risk runs its own risk-focused search +
-fundamentals check independently of the other three) → shadow `policy`
-after `quant` → `decision`
+fundamentals check independently of the other three) → `decision`
 (combines all four into a structured buy/hold/sell + price target via
 `DecisionOutput`, with `risk`'s hard/soft flags enforced by
 `apply_risk_override()` — see `docs/multi_agent_architecture.md`) → draft
@@ -217,8 +210,8 @@ uvicorn app.main:app --reload
 ```
 Then open `http://127.0.0.1:8000/docs` to test the endpoints interactively:
 - `POST /analyze {ticker}` — runs the pipeline through `draft_summary_node`,
-  returns `{session_id, decision, policy_signal, policy_prediction_id, draft}`.
-  `decision` remains the production call; `policy_signal` is observational.
+  returns `{session_id, decision, quant_prediction_id, draft}` and stores the
+  quant prediction for delayed five-day evaluation.
 - `POST /approve/{session_id} {approved}` — approve to finalize, or reject
   to get a redraft (same revision cap as the CLI flow); call it again with
   the same `session_id` until it's approved or the cap is hit.

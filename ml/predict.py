@@ -7,6 +7,7 @@ Run standalone (needs ml/model.pkl — run `python -m ml.train` first):
 """
 
 import sys
+from pathlib import Path
 from typing import Optional
 
 import joblib
@@ -16,15 +17,21 @@ from ml.features import FEATURE_COLUMNS, build_feature_row
 from ml.train import MODEL_PATH
 
 _model = None
+_model_mtime = None
 
 
 def _get_model():
-    global _model
-    if _model is None:
-        try:
-            _model = joblib.load(MODEL_PATH)
-        except FileNotFoundError:
-            return None
+    global _model, _model_mtime
+    path = Path(MODEL_PATH)
+    try:
+        mtime = path.stat().st_mtime_ns
+    except FileNotFoundError:
+        _model = None
+        _model_mtime = None
+        return None
+    if _model is None or _model_mtime != mtime:
+        _model = joblib.load(path)
+        _model_mtime = mtime
     return _model
 
 

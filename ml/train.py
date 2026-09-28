@@ -10,7 +10,12 @@ that then gets evaluated on rows *before* it — a direct form of the
 leakage / train-serve-skew problem: a time-series model must only ever
 be evaluated on data strictly later in time than everything it trained
 on, mirroring how it will actually be used (predicting the future from
-the past, never the reverse).
+the past, never the reverse). After reporting those held-out metrics, a
+fresh final model is fitted on all known labels and saved for serving.
+
+train(extra_rows=...) also accepts settled live predictions from
+rl.feedback, keeping delayed learning in this existing LightGBM instead
+of introducing a second model over the same features.
 
 This fits an AutoARIMA model once per sampled historical row (an order
 search, not a lookup). Pooling multiple tickers over years of history
@@ -70,38 +75,56 @@ def build_training_panel(tickers: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def train() -> None:
+def train(extra_rows: Optional[list[dict]] = None) -> bool:
+    """Evaluates on a time split, then fits the saved model on all known labels."""
     tickers = [t.strip() for t in os.getenv("STOCK_LIST", "AAPL,MSFT").split(",") if t.strip()]
     print(f"Building training panel for {tickers}...")
     panel = build_training_panel(tickers)
-    print(f"Total: {len(panel)} rows across {len(tickers)} tickers")
+    if extra_rows:
+        supplemental = pd.DataFrame(extra_rows)
+        required = {*FEATURE_COLUMNS, "label", "ticker", "date"}
+        missing = required.difference(supplemental.columns)
+        if missing:
+            raise ValueError(f"Supplemental rows are missing columns: {sorted(missing)}")
+        panel = pd.concat([panel, supplemental], ignore_index=True)
+        print(f"Added {len(supplemental)} settled live-feedback row(s)")
     if panel.empty:
         print("No usable rows — nothing to train on.")
-        return
+        return False
 
-    train_df = panel[panel["date"] < TRAIN_TEST_SPLIT_DATE]
-    test_df = panel[panel["date"] >= TRAIN_TEST_SPLIT_DATE]
+    panel["date"] = pd.to_datetime(panel["date"], utc=True).dt.tz_localize(None)
+    panel = panel.drop_duplicates(["ticker", "date"], keep="last")
+    print(f"Total: {len(panel)} rows across {len(tickers)} tickers")
+    split_date = pd.Timestamp(TRAIN_TEST_SPLIT_DATE)
+    train_df = panel[panel["date"] < split_date]
+    test_df = panel[panel["date"] >= split_date]
     print(f"Train: {len(train_df)} rows, Test: {len(test_df)} rows (time-based split at {TRAIN_TEST_SPLIT_DATE})")
+
     if train_df.empty:
-        print("No rows before the split date — nothing to train on.")
-        return
-
-    model = lgb.LGBMClassifier(n_estimators=200, max_depth=4, learning_rate=0.05)
-    model.fit(train_df[FEATURE_COLUMNS], train_df["label"])
-
-    if not test_df.empty:
-        preds = model.predict(test_df[FEATURE_COLUMNS])
-        probs = model.predict_proba(test_df[FEATURE_COLUMNS])[:, 1]
-        print(f"Test accuracy: {accuracy_score(test_df['label'], preds):.3f}")
-        if test_df["label"].nunique() > 1:
-            print(f"Test AUC: {roc_auc_score(test_df['label'], probs):.3f}")
-        else:
-            print("Test AUC: undefined (test set has only one label class)")
+        print("No rows before the split date — skipping held-out evaluation.")
     else:
-        print("No test rows past the split date — can't report held-out metrics.")
+        evaluation_model = lgb.LGBMClassifier(
+            n_estimators=200, max_depth=4, learning_rate=0.05
+        )
+        evaluation_model.fit(train_df[FEATURE_COLUMNS], train_df["label"])
+        if not test_df.empty:
+            preds = evaluation_model.predict(test_df[FEATURE_COLUMNS])
+            probs = evaluation_model.predict_proba(test_df[FEATURE_COLUMNS])[:, 1]
+            print(f"Test accuracy: {accuracy_score(test_df['label'], preds):.3f}")
+            if test_df["label"].nunique() > 1:
+                print(f"Test AUC: {roc_auc_score(test_df['label'], probs):.3f}")
+            else:
+                print("Test AUC: undefined (test set has only one label class)")
+        else:
+            print("No test rows past the split date — can't report held-out metrics.")
 
-    joblib.dump(model, MODEL_PATH)
+    final_model = lgb.LGBMClassifier(
+        n_estimators=200, max_depth=4, learning_rate=0.05
+    )
+    final_model.fit(panel[FEATURE_COLUMNS], panel["label"])
+    joblib.dump(final_model, MODEL_PATH)
     print(f"Saved model to {MODEL_PATH}")
+    return True
 
 
 if __name__ == "__main__":

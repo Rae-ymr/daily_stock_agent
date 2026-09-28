@@ -20,6 +20,7 @@ from agent.graph import (
 from app.heatmap import build_heatmap_html
 from app.session_store import create_session, delete_session, load_session, update_session
 from data.ingest_prices import fetch_price_history
+from rl.feedback import record_live_prediction
 
 # Mirrors the revision cap in agent/graph.py's route_after_checkpoint —
 # reject twice and the pipeline finalizes as rejected instead of
@@ -46,6 +47,17 @@ def analyze(req: AnalyzeRequest):
     POST /approve/{session_id} with the human's decision to continue.
     """
     state = run_analysis(req.ticker)
+    prediction_id = None
+    if state.get("policy_signal"):
+        try:
+            prediction_id = record_live_prediction(
+                req.ticker,
+                state.get("quant_signal"),
+                state["policy_signal"],
+            )
+        except Exception as exc:
+            # Shadow learning must never make the primary analysis endpoint fail.
+            print(f"Could not record online-policy prediction: {exc}")
 
     session_id = create_session(
         {
@@ -60,6 +72,8 @@ def analyze(req: AnalyzeRequest):
         "session_id": session_id,
         "ticker": req.ticker,
         "decision": state.get("decision"),
+        "policy_signal": state.get("policy_signal"),
+        "policy_prediction_id": prediction_id,
         "draft": state["draft"],
     }
 

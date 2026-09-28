@@ -16,7 +16,8 @@ flowchart TD
     B --> R["risk\n(own RAG query + fundamentals)"]
     T --> DEC["decision\n(structured buy/hold/sell)"]
     I --> DEC
-    Q --> DEC
+    Q --> P["online policy\n(shadow only)"]
+    P --> DEC
     R --> DEC
     DEC --> D[draft_summary]
     D --> E[human_checkpoint]
@@ -26,7 +27,7 @@ flowchart TD
 `technical`, `intel`, `quant`, and `risk` all run in the same LangGraph
 superstep — genuinely parallel, not just adjacent in the code — because
 none of the four depends on any of the others' output. `decision` fans
-in from all four.
+in after the four specialists and the lightweight shadow policy step.
 
 Risk detection doesn't need the other three agents' conclusions to do
 its job (see "Why risk doesn't need to run after the others" below), so
@@ -40,15 +41,19 @@ reads happen concurrently, one decision-maker synthesizes all four.
 | `technical_node` | `price_summary`, `technical_indicators` (MA crossover, RSI, MACD, Bollinger width, volatility, volume change) | news, market data | `technical_analysis` (free text) |
 | `intel_node` | `retrieved_context` (corrective-RAG news) | price data | `intel_analysis` (free text) |
 | `quant_node` | trained LightGBM model + live feature row (see below) | news, LLM reasoning | `quant_signal` (`{probability_up, features}`, or `None` if untrained) |
+| `policy_node` | `quant_signal.features` + incrementally trained return policy | news, final decision prompt | `policy_signal` (shadow recommendation) |
 | `risk_node` | its own risk-focused RAG query, fundamentals (P/E, P/B) | technical/intel/quant's conclusions | `risk_assessment` (`RiskAssessment`: list of `RiskFlag` + summary) |
 | `decision_node` | all of the above | — | `decision` (structured `DecisionOutput`) + `analysis` (text, for `draft_summary_node`) |
 
 `technical_node` and `intel_node` are deliberately scoped to *not* see
 each other's domain — each is told explicitly not to reference the
 other's kind of signal. `quant_node` is a different *kind* of signal
-entirely — not an LLM call at all, see below. `decision_node` is where
-all four reads get combined, and it's told to surface technical/intel
-disagreement rather than silently picking a side.
+entirely — not an LLM call at all, see below. `policy_node` reuses quant's
+feature row and produces a shadow recommendation that is logged for
+five-trading-day delayed feedback. It is deliberately omitted from the
+decision prompt, so it cannot change the production rating yet.
+`decision_node` combines the four production reads and surfaces
+technical/intel disagreement rather than silently picking a side.
 
 ## Why risk doesn't need to run after the others
 

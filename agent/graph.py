@@ -28,6 +28,7 @@ from agent.retrieval import build_vector_store, retrieve_with_retry
 from agent.tools import get_price_summary, get_recent_news
 from data.ingest_prices import fetch_fundamentals, fetch_technical_indicators
 from ml.predict import predict_5d_up_probability
+from rl.policy import load_policy
 
 _llm = get_chat_llm()
 
@@ -95,6 +96,7 @@ class AgentState(TypedDict):
     technical_analysis: str
     intel_analysis: str
     quant_signal: Optional[dict]
+    policy_signal: Optional[dict]
     risk_assessment: Optional[dict]
     decision: Optional[dict]
     analysis: str
@@ -226,6 +228,28 @@ def quant_node(state: AgentState) -> dict:
     opinion."
     """
     return {"quant_signal": predict_5d_up_probability(state["ticker"])}
+
+
+def policy_node(state: AgentState) -> dict:
+    """
+    Produces an independent online-policy recommendation in shadow mode.
+
+    It reads the quant node's already-built feature row to avoid another
+    market-data fetch. The signal is displayed and logged for delayed
+    five-day learning, but decision_node deliberately does not include it
+    in the LLM prompt, so it cannot change the final recommendation yet.
+    """
+    quant = state.get("quant_signal")
+    if not quant or not quant.get("features"):
+        return {"policy_signal": None}
+    try:
+        policy = load_policy()
+        if policy is None:
+            return {"policy_signal": None}
+        signal = policy.predict(quant["features"])
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {"policy_signal": None}
+    return {"policy_signal": signal.as_dict()}
 
 
 def risk_node(state: AgentState) -> dict:
@@ -367,10 +391,18 @@ def decision_node(state: AgentState) -> dict:
     intel = state.get("intel_analysis", "none")
     risk = state.get("risk_assessment") or {"flags": [], "summary": "none"}
     quant = state.get("quant_signal")
+    policy = state.get("policy_signal")
     quant_text = (
         f"{quant['probability_up']:.0%} probability of a positive 5-day return"
         if quant
         else "unavailable (model not trained — python -m ml.train)"
+    )
+    policy_text = (
+        f"{policy['action']} at {policy['allocation']:.0%} allocation "
+        f"(predicted 5-day return {policy['predicted_5d_return']:+.2%}, "
+        f"confidence {policy['confidence']:.0%}, shadow only)"
+        if policy
+        else "unavailable (bootstrap with python -m rl.train_policy)"
     )
     messages = [
         SystemMessage(
@@ -407,7 +439,8 @@ def decision_node(state: AgentState) -> dict:
         f"\nBuy range: {format_range(result.buy_range)}"
         f"\nSell range: {format_range(result.sell_range)}"
         f"\nRationale: {result.rationale}"
-        + f"\n\nTechnical: {technical}\nIntel: {intel}\nQuant: {quant_text}\nRisk: {risk['summary']}"
+        + f"\n\nTechnical: {technical}\nIntel: {intel}\nQuant: {quant_text}"
+        + f"\nOnline policy: {policy_text}\nRisk: {risk['summary']}"
     )
     decision_dict = result.model_dump()
     decision_dict["risk_level"] = risk_level
@@ -516,6 +549,7 @@ def _add_analysis_graph(graph: StateGraph) -> None:
     graph.add_node("technical", technical_node)
     graph.add_node("intel", intel_node)
     graph.add_node("quant", quant_node)
+    graph.add_node("policy", policy_node)
     graph.add_node("risk", risk_node)
     graph.add_node("decision", decision_node)
     graph.add_node("draft_summary", draft_summary_node)
@@ -524,15 +558,16 @@ def _add_analysis_graph(graph: StateGraph) -> None:
     graph.add_edge("ingest", "retrieve_and_grade")
     # Fan-out: technical, intel, quant, and risk all run off
     # retrieve_and_grade's output, in the same superstep (LangGraph runs
-    # them concurrently) — none of the four depends on any of the others'
-    # output. Fan-in: decision only runs once all four have completed.
+    # them concurrently). The shadow policy then consumes quant's feature
+    # row; decision waits for policy but does not use it to set the rating.
     graph.add_edge("retrieve_and_grade", "technical")
     graph.add_edge("retrieve_and_grade", "intel")
     graph.add_edge("retrieve_and_grade", "quant")
     graph.add_edge("retrieve_and_grade", "risk")
     graph.add_edge("technical", "decision")
     graph.add_edge("intel", "decision")
-    graph.add_edge("quant", "decision")
+    graph.add_edge("quant", "policy")
+    graph.add_edge("policy", "decision")
     graph.add_edge("risk", "decision")
     graph.add_edge("decision", "draft_summary")
 
